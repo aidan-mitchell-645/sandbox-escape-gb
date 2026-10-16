@@ -3,3 +3,5 @@
 *.sym
 *.sav
 .DS_Store
+*.ram
+__pycache__/

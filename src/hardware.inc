@@ -44,6 +44,14 @@ DEF rNR11  EQU $FF11
 DEF rNR12  EQU $FF12
 DEF rNR13  EQU $FF13
 DEF rNR14  EQU $FF14
+DEF rNR21  EQU $FF16   ; CH2 duty / length
+DEF rNR22  EQU $FF17   ; CH2 envelope
+DEF rNR23  EQU $FF18   ; CH2 freq lo
+DEF rNR24  EQU $FF19   ; CH2 freq hi / trigger
+DEF rNR41  EQU $FF20   ; CH4 length
+DEF rNR42  EQU $FF21   ; CH4 envelope
+DEF rNR43  EQU $FF22   ; CH4 polynomial counter
+DEF rNR44  EQU $FF23   ; CH4 trigger
 DEF rNR50  EQU $FF24
 DEF rNR51  EQU $FF25
 DEF rNR52  EQU $FF26

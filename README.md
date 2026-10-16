@@ -46,22 +46,28 @@ Sandbox Escape is a multi-level platformer. Each level is a multi-zone environme
 | Button | Action |
 |--------|--------|
 | **← →** | Move left / right |
-| **A** | Jump |
-| **B** | Scan vulnerability node (when near) / Use exploit (when carrying one) |
-| **Start** | — |
-| **Select** | — |
+| **A** | Jump — hold for a full jump, tap for a short hop |
+| **B** | Scan vulnerability node (when near) / Use exploit (when carrying one). The scan beam fires the way you're facing. |
+| **A** (dialog) | Dismiss message |
+| **Start** | Title: start · Map: face PATCH.EXE (once all five levels are cleared) · Win screen: back to title |
+| **Select** | Title: erase saved progress |
+
+Movement has momentum: you accelerate up to speed and slide briefly to a stop. A jump pressed just before landing still fires, and so does one pressed a moment after running off a ledge.
 
 ### HUD
 
-The bottom bar shows your current status at all times:
+The bottom bar shows the level, zone and your status at all times:
 
 ```
-HP:■■■■■  VULNS:--  EXP:--
+L1 CELL BLOCK 0
+HP:5 VULNS:0 EXP:0
 ```
 
 - **HP** — you start each level with 5 health points
-- **VULNS** — which vulnerability nodes you've scanned (filled when scanned)
-- **EXP** — which exploit tool you're currently carrying
+- **VULNS** — how many vulnerability nodes you've exploited
+- **EXP** — which exploit tool you're carrying (0 = none)
+
+Messages (scan results, pickups) open in a panel over the bottom of the screen; the zone stays visible behind it.
 
 ---
 
@@ -71,23 +77,25 @@ Each level has a distinct theme drawn from real infrastructure attack surfaces. 
 
 | Level | Environment | CVEs |
 |-------|-------------|------|
-| **L1** | BASH SHELL / APACHE ROOT / ENV HANDLER / CMD INJECTOR | CVE-2014-6271 (Shellshock), CVE-2021-41773 (Apache Path Traversal) |
-| **L2** | STRUTS CORE / RDP GATEWAY / CLASSLOADER / HEAP SPRAY | CVE-2017-5638 (Struts2 RCE), CVE-2019-0708 (BlueKeep RDP) |
-| **L3** | EXCHANGE OWA / KERNEL PIPE / NTLM RELAY / PIPE BUFFER | CVE-2021-26855 (ProxyLogon), CVE-2022-0847 (Dirty Pipe) |
-| **L4** | HTTP2 STACK / PAN-OS VPN / STREAM RESET / PRIV CHAIN | CVE-2023-44487 (HTTP/2 Rapid Reset), CVE-2024-3400 (PAN-OS) |
-| **L5** | CELL BLOCK 0 / NET CORRIDOR / KERNEL SPACE / FIREWALL v9.1 | CVE-2021-44228 (Log4Shell), CVE-2017-0144 (EternalBlue), CVE-2021-3156 (Sudo Baron Samedit) |
+| **L1** | CELL BLOCK 0 / CELL BLOCK 1 / NET CORRIDOR / KERNEL SPACE / FIREWALL v9.1 / NET HUB | CVE-2021-44228 (Log4Shell), CVE-2017-0144 (EternalBlue), CVE-2021-3156 (Sudo Baron Samedit) |
+| **L2** | BASH SHELL / APACHE ROOT / ENV HANDLER / CMD INJECTOR | CVE-2014-6271 (Shellshock), CVE-2021-41773 (Apache Path Traversal) |
+| **L3** | STRUTS CORE / RDP GATEWAY / CLASSLOADER / HEAP SPRAY | CVE-2017-5638 (Struts2 RCE), CVE-2019-0708 (BlueKeep RDP) |
+| **L4** | EXCHANGE OWA / KERNEL PIPE / NTLM RELAY / PIPE BUFFER | CVE-2021-26855 (ProxyLogon), CVE-2022-0847 (Dirty Pipe) |
+| **L5** | HTTP2 STACK / PAN-OS VPN / STREAM RESET / PRIV CHAIN | CVE-2023-44487 (HTTP/2 Rapid Reset), CVE-2024-3400 (PAN-OS) |
+
+Cleared levels are saved to the cartridge battery and shown as broken nodes on the world map.
 
 ---
 
 ## Enemies
 
 ### Advisory Daemons
-Crawling bug sprites that patrol specific zones. Higher levels deploy more of them — L3 has 3, L4 has 4, L5 has 5. Touch one and you're **PATCHED** — sent back to the world map to regroup.
+Crawling bug sprites that patrol specific zones. Higher levels deploy more of them — L3 has 3, L4 has 4, L5 has 5. Touching one costs 1 HP and knocks you back; you blink and are invulnerable for a moment afterwards. Lose all 5 HP and you're **PATCHED** — sent back to the world map to regroup.
 
 A brief spawn grace period protects you immediately after entering a zone.
 
 ### PATCH.EXE (Final Boss)
-Beat all five levels and you face the sandbox's last defence: **PATCH.EXE**. It charges across the arena floor. Stay out of its path and fire your scan beam (**B**) to hit it — 3 hits to neutralise it. You need to be on the same floor as PATCH.EXE for the scan to connect.
+Beat all five levels and you face the sandbox's last defence: **PATCH.EXE**. It charges across the arena floor. Contact costs HP. Face it, stand on its floor and fire your scan beam (**B**) — the beam has to actually reach PATCH.EXE to land a hit. 3 hits to neutralise it. If it patches you, press **Start** on the world map to try again.
 
 ---
 
@@ -116,13 +124,14 @@ Written from scratch in **RGBDS Z80 assembly** targeting the **Game Boy Color**.
 | Platform | Game Boy Color (GBC-enhanced, DMG-compatible) |
 | Mapper | MBC1 |
 | ROM size | 64 KB (banks 0–2 used, bank 3 free) |
-| RAM | None |
+| Cartridge RAM | 8 KB, battery-backed (save data) |
 | Resolution | 160×144 |
 | Colours | GBC 15-bit palette (teal/green cyberpunk scheme) |
 | Audio | 2-channel pulse (CH1 melody + CH2 harmony) |
-| Sync | LY-polling VBlank (no interrupts) |
+| Sync | VBlank interrupt + `halt` |
+| VRAM access | Gameplay tile changes go through a write queue flushed in VBlank; collision reads a WRAM copy of the zone map |
 | OAM | DMA via HRAM routine |
-| Physics | AABB tile collision, 8-bit fixed-point |
+| Physics | AABB tile collision; horizontal velocity in 1/16 px with sub-pixel position |
 
 ### ROM Layout
 
@@ -134,7 +143,7 @@ Written from scratch in **RGBDS Z80 assembly** targeting the **Game Boy Color**.
 
 ### Building
 
-Requires [RGBDS](https://rgbds.gbdev.io/) (tested with v0.6+).
+Requires [RGBDS](https://rgbds.gbdev.io/) (tested with v0.9.4).
 
 ```bash
 git clone https://github.com/aidan-mitchell-645/sandbox-escape-gb
@@ -142,7 +151,16 @@ cd sandbox-escape-gb
 make
 ```
 
-Output: `build/sandbox-escape.gb`
+Output: `build/sandbox-escape.gb`, plus `build/sandbox-escape.sym` and `.map` for debuggers such as BGB, Emulicious or SameBoy.
+
+### Tests
+
+```bash
+pip install pyboy
+make test
+```
+
+`tests/test_game.py` boots the ROM headlessly in [PyBoy](https://github.com/Baekalfen/PyBoy) and checks gameplay rules (damage, pickups, boss hits, saves, physics) and that VRAM is only written during VBlank. CI builds the ROM, checks the committed `build/sandbox-escape.gb` matches the source, and runs the tests on every push.
 
 Run in any GBC-compatible emulator — [SameBoy](https://sameboy.github.io/), [mGBA](https://mgba.io/), [BGB](https://bgb.bircd.org/), or on real hardware via a flash cart.
 
