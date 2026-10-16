@@ -1,0 +1,43 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      RGBDS_VERSION: v0.9.4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install RGBDS
+        run: |
+          mkdir -p "$RUNNER_TEMP/rgbds"
+          curl -sSLf "https://github.com/gbdev/rgbds/releases/download/${RGBDS_VERSION}/rgbds-linux-x86_64.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP/rgbds"
+          echo "$RUNNER_TEMP/rgbds" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyBoy
+        run: pip install pyboy
+
+      - name: Build
+        run: make clean && make
+
+      - name: Committed ROM is up to date
+        run: git diff --exit-code -- build/sandbox-escape.gb
+
+      - name: Test
+        run: make test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-escape
+          path: |
+            build/sandbox-escape.gb
+            build/sandbox-escape.sym

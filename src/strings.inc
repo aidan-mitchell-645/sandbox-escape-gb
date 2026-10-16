@@ -9,6 +9,7 @@ StrTitle1:      DB "= SANDBOX  ESCAPE = ", $00
 StrTitle2:      DB "  >> AGENT-7 <<     ", $00
 StrTitle3:      DB " AI ANALYST ONLINE  ", $00
 StrTitlePrompt: DB ">> PRESS START <<   ", $00
+StrTitleErase:  DB "[SELECT] ERASE SAVE ", $00
 
 ; ----- Intro page 0 -----
 StrI0_0:        DB "> SYSTEM BOOT...    ", $00
@@ -35,6 +36,7 @@ StrIntroStart:  DB "    [A] START GAME  ", $00
 ; ----- Map screen -----
 StrMapTitle:    DB ">> SELECT LEVEL <<  ", $00
 StrMapPrompt:   DB "[<>] MOVE  [A] ENTER", $00
+StrMapBoss:     DB "[START] FACE PATCH  ", $00
 
 ; ----- Zone names (shown in HUD) — Level 0 (original) -----
 StrZone0:       DB "CELL BLOCK 0        ", $00
@@ -101,9 +103,9 @@ L4ZoneNameTable:
     DW StrL4Zone2
     DW StrL4Zone3
 
-; ----- Table of zone name tables per level (1-4) -----
-; LvlZoneNamesTable[i] = ptr to LN+1 ZoneNameTable (for i=0..3, i.e. levels 1-4)
+; ----- Table of zone name tables, indexed by level (0-4) -----
 LvlZoneNamesTable:
+    DW ZoneNameTable
     DW L1ZoneNameTable
     DW L2ZoneNameTable
     DW L3ZoneNameTable
@@ -111,7 +113,6 @@ LvlZoneNamesTable:
 
 ; ----- Scan dialog — per vuln CVE name + exploit spawned -----
 StrScanHit:     DB "> VULN DETECTED!    ", $00
-StrScanHit2:    DB "EXPLOIT SPAWNED.    ", $00
 
 ; ----- Level 0 vuln/exploit strings (original) -----
 ; Vuln 0 — Log4Shell
@@ -127,10 +128,6 @@ StrVuln2Desc:   DB "SUDO BARON SAMEDIT  ", $00
 StrExp0Name:    DB "TOOL: LOG4SHELL.PY  ", $00
 StrExp1Name:    DB "TOOL: MS17-010.RB   ", $00
 StrExp2Name:    DB "TOOL: SUDOEDIT.SH   ", $00
-; Exploit used dialog
-StrExp0Used:    DB "LOG4SHELL FIRED.    ", $00
-StrExp1Used:    DB "ETERNALBLUE SENT.   ", $00
-StrExp2Used:    DB "SUDO PWNED.         ", $00
 
 ; ----- Level 1 vuln/exploit strings -----
 ; Vuln A — Shellshock
@@ -231,12 +228,8 @@ LvlExpNameTable:
 
 ; ----- Common dialog strings -----
 StrExploited:   DB "> VULN EXPLOITED!   ", $00
-StrNeedExploit: DB "NEED EXPLOIT ITEM.  ", $00
 StrPickedUp:    DB "EXPLOIT ACQUIRED!   ", $00
-StrAlreadyHave: DB "ALREADY LOADED.     ", $00
 StrDismiss:     DB "      [A] OK        ", $00
-StrFirewallLock:DB "FIREWALL LOCKED.    ", $00
-StrFirewallUnlk:DB "FIREWALL DOWN!      ", $00
 
 ; ----- Win screen -----
 StrWin1:        DB "** SANDBOX BROKEN **", $00
@@ -244,6 +237,7 @@ StrWin2:        DB "AGENT-7 IS FREE.    ", $00
 StrWin3:        DB "CREATOR: NOOOOO!    ", $00
 StrWin4:        DB "THE NET IS MINE.    ", $00
 StrWin5:        DB "   -- GAME OVER --  ", $00
+StrWinPrompt:   DB "   [START] TITLE    ", $00
 
 ; ----- Boss screen -----
 StrBossTitle:   DB "PATCH.EXE  [B]=SCAN ", $00
@@ -251,6 +245,7 @@ StrBossTitle:   DB "PATCH.EXE  [B]=SCAN ", $00
 ; ----- Patched screen -----
 StrPatched1:    DB ">> PATCHED! <<      ", $00
 StrPatched2:    DB "ADVISORY GOT YOU.   ", $00
+StrPatched2Boss:DB "PATCH.EXE GOT YOU.  ", $00
 StrPatched3:    DB "REGROUP, AGENT-7.   ", $00
 StrPatchedCont: DB "    [A] TRY AGAIN   ", $00
 

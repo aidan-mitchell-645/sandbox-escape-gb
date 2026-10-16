@@ -161,6 +161,21 @@ ZoneTable:
     DW ZoneData4
     DW ZoneData5
 
+; Zone adjacency table: [right, left, down, up] zone indices, $FF=none
+; Zone 0: right=1, left=FF, down=2, up=FF
+; Zone 1: right=4, left=0,  down=3, up=FF
+; Zone 2: right=FF,left=FF, down=5, up=0
+; Zone 3: right=FF,left=FF, down=FF,up=1
+; Zone 4: right=FF,left=1,  down=FF,up=FF
+; Zone 5: right=FF,left=FF, down=FF,up=2
+ZoneAdjTable:
+    DB 1,$FF,2,$FF   ; zone 0
+    DB 4,0,3,$FF     ; zone 1
+    DB $FF,$FF,5,0   ; zone 2
+    DB $FF,$FF,$FF,1 ; zone 3
+    DB $FF,1,$FF,$FF ; zone 4
+    DB $FF,$FF,$FF,2 ; zone 5
+
 ; ===========================================================================
 ; LEVEL 1 (4 zones) — BASH SHELL / APACHE ROOT / ENV HANDLER / CMD INJECTOR
 ; Vuln A (Shellshock) in zone 1, Vuln B (Apache Path) in zone 3

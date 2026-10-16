@@ -1,15 +1,21 @@
 ; ===========================================================================
 ;  SANDBOX ESCAPE — Game Boy Color Platformer
-;  Build 9 — Full platformer rewrite
+;  Build 10
 ;
 ;  Architecture:
-;   - No interrupts, no halt. Pure LY-polling VBlank sync.
-;   - DMA OAM copy via HRAM routine.
-;   - GBC flag detected at boot, stored in HRAM + WRAM.
-;   - BG layer = world tilemap (scrolled via rSCX/rSCY).
-;   - Window layer = HUD (bottom 2 rows, rWY = 128).
-;   - Sprites: player (2 OBJ, 8×16 effective), vuln nodes, exploit pickups.
-;   - Physics: 8-bit fixed-point positions, AABB tile collision.
+;   - VBlank interrupt + HALT for frame sync (ISR only raises a flag).
+;   - Each frame begins with the VBlank-only work: OAM DMA, the VRAM write
+;     queue, and dialog-panel streaming. Game logic never touches VRAM
+;     while the LCD is on; it calls QueueTile instead.
+;   - The current zone's tilemap is mirrored in WRAM (wZoneMap); collision
+;     and pickup checks read the mirror, never VRAM.
+;   - BG layer = world tilemap. Window layer = HUD (WY = 128), raised to
+;     WY = 80 to show the dialog panel over gameplay.
+;   - Sprites: player (2 OBJ, 8×16 effective), vuln nodes, exploit pickups,
+;     advisories, boss.
+;   - Physics: whole-pixel vertical motion; horizontal velocity in 1/16 px
+;     with sub-pixel position. AABB tile collision.
+;   - Level progress is saved to battery-backed cartridge RAM (MBC1).
 ; ===========================================================================
 
 INCLUDE "hardware.inc"
@@ -23,55 +29,57 @@ DEF STATE_PLAY    EQU 2
 DEF STATE_DIALOG  EQU 3
 DEF STATE_WIN     EQU 4
 DEF STATE_MAP     EQU 5   ; world map between levels
-DEF STATE_PATCHED EQU 6   ; "you've been patched" screen after advisory hit
+DEF STATE_PATCHED EQU 6   ; "you've been patched" screen after losing all HP
 DEF STATE_BOSS    EQU 7   ; boss fight vs Patch
 
 ; ---------------------------------------------------------------------------
+; Constants — Joypad bits (wJoypad layout)
+; ---------------------------------------------------------------------------
+DEF PADB_A        EQU 0
+DEF PADB_B        EQU 1
+DEF PADB_SELECT   EQU 2
+DEF PADB_START    EQU 3
+DEF PADB_RIGHT    EQU 4
+DEF PADB_LEFT     EQU 5
+DEF PADB_UP       EQU 6
+DEF PADB_DOWN     EQU 7
+
+; ---------------------------------------------------------------------------
 ; Constants — Physics
+; Vertical velocity is whole pixels per frame (signed byte).
+; Horizontal velocity is in 1/16 px per frame (signed byte); the fractional
+; part of X lives in wPXSub.
 ; ---------------------------------------------------------------------------
 DEF GRAVITY       EQU 1
 DEF JUMP_VY       EQU 246   ; -10 as unsigned byte (256-10)
-DEF RUN_VX        EQU 1
+DEF JUMP_CUT_VY   EQU 253   ; -3: rise speed cap once A is released (short hop)
 DEF MAX_FALL      EQU 8     ; must match intYStep clamp (8px max per frame)
-DEF FRICTION      EQU 1
+DEF RUN_MAX       EQU 24    ; 1.5 px/frame
+DEF RUN_ACCEL     EQU 3
+DEF GROUND_FRIC   EQU 4     ; also added when reversing direction
+DEF AIR_FRIC      EQU 1
+DEF COYOTE_FRAMES EQU 6     ; jump still allowed this long after leaving a ledge
+DEF JUMP_BUF_FRAMES EQU 6   ; A pressed this long before landing still jumps
+
+; ---------------------------------------------------------------------------
+; Constants — Health / damage
+; ---------------------------------------------------------------------------
+DEF MAX_HEALTH    EQU 5
+DEF INVULN_FRAMES EQU 90    ; blinking i-frames after a hit
+DEF KNOCK_FRAMES  EQU 12    ; first part of i-frames where steering is ignored
+DEF KNOCK_VX      EQU 32    ; 2 px/frame
+DEF KNOCK_VY      EQU 251   ; -5
+DEF SPAWN_GRACE   EQU 60    ; frames after a zone load before enemies can hit
 
 ; ---------------------------------------------------------------------------
 ; Constants — Zone / world
 ; ---------------------------------------------------------------------------
-DEF NUM_ZONES     EQU 6   ; level 0 zone count (original)
 DEF ZONE_COLS     EQU 20
 DEF ZONE_ROWS     EQU 16
 DEF ZONE_SIZE     EQU ZONE_COLS * ZONE_ROWS   ; 320 bytes per zone
-
-; Zone connection constants (which zone connects where)
-; Each zone edge encodes: direction + target zone
-DEF EDGE_NONE     EQU $FF
-DEF DIR_RIGHT     EQU 0
-DEF DIR_LEFT      EQU 1
-DEF DIR_DOWN      EQU 2
-DEF DIR_UP        EQU 3
-
-; Passage tile rows/cols (open gap in wall)
-DEF PASS_ROW      EQU 8     ; passage starts at row 8
-DEF PASS_COL      EQU 8     ; passage starts at col 8
-
-
-; Vuln node indices
-DEF VULN_0        EQU 0     ; Zone 0, col 12, row 7
-DEF VULN_1        EQU 1     ; Zone 3, col 10, row 8
-DEF VULN_2        EQU 2     ; Zone 4, col 8,  row 8
-
-; Exploit spawn zone/col/row (activated after scanning corresponding vuln)
-; Each exploit floats in a void row ABOVE a platform so it is visible and reachable.
-DEF EXP0_ZONE     EQU 5
-DEF EXP0_COL      EQU 7          ; Zone 5 platform at row 3 cols 4-10, col 7 row 2 = void above
-DEF EXP0_ROW      EQU 2
-DEF EXP1_ZONE     EQU 2
-DEF EXP1_COL      EQU 7          ; Zone 2 platform at row 5 cols 4-11, col 7 row 4 = void above
-DEF EXP1_ROW      EQU 4
-DEF EXP2_ZONE     EQU 1
-DEF EXP2_COL      EQU 9          ; Zone 1 platform at row 6 cols 7-11, col 9 row 5 = void above
-DEF EXP2_ROW      EQU 5
+DEF MAX_VULNS     EQU 3
+DEF NUM_LEVELS    EQU 5
+DEF ALL_LEVELS    EQU (1 << NUM_LEVELS) - 1
 
 ; OBJ tile indices — sprites loaded at $8800 = OBJ tile $80 in BG8000 mode
 DEF SPR_HEAD_IDLE EQU $80
@@ -84,15 +92,16 @@ DEF SPR_HEAD_JUMP EQU $86
 DEF SPR_BODY_JUMP EQU $87
 DEF SPR_VULN_A    EQU $88
 DEF SPR_VULN_B    EQU $89
-DEF SPR_EXP_PICK  EQU $8A   ; exploit 0: microchip (Log4Shell)
-DEF SPR_EXP_SCR   EQU $8B   ; exploit 1: script file (EternalBlue)
-DEF SPR_EXP_TERM  EQU $8C   ; exploit 2: terminal prompt (Sudo Baron)
+DEF SPR_EXP_PICK  EQU $8A   ; exploit 0: microchip
+DEF SPR_EXP_SCR   EQU $8B   ; exploit 1: script file
+DEF SPR_EXP_TERM  EQU $8C   ; exploit 2: terminal prompt
 DEF SPR_ADVISORY  EQU $8D   ; advisory enemy: crawling bug
 DEF SPR_BOSS_HEAD EQU $8E   ; Patch boss head
 DEF SPR_BOSS_BODY EQU $8F   ; Patch boss body
 
-; BG gameplay tile indices — loaded at $8C00 = BG tile $60+ in BG8000 mode
+; BG gameplay tile indices — loaded at $8600 = BG tile $60+ in BG8000 mode
 ; (font occupies $8000-$85E0 = tiles $00-$5E)
+DEF T_SPACE       EQU $00   ; font space (blank)
 DEF T_VOID        EQU $60
 DEF T_PLAT_MID    EQU $61
 DEF T_PLAT_L      EQU $62
@@ -101,62 +110,53 @@ DEF T_WALL        EQU $64
 DEF T_BG_DOT      EQU $65
 DEF T_BG_HLINE    EQU $66
 DEF T_BG_VLINE    EQU $67
-DEF T_VULN_A_BG   EQU $68
-DEF T_VULN_B_BG   EQU $69
+DEF T_VULN_A      EQU $68
+DEF T_VULN_B      EQU $69
 DEF T_VULN_SCAN   EQU $6A
 DEF T_VULN_EXP    EQU $6B
 DEF T_EXPLOIT     EQU $6C
 DEF T_HUD_BAR     EQU $6D
 DEF T_BEAM_FULL   EQU $6E
 DEF T_BEAM_FADE   EQU $6F
-
-; Aliases and derived constants (defined after the tile IDs they reference)
-DEF T_VULN_A      EQU T_VULN_A_BG
-DEF T_VULN_B      EQU T_VULN_B_BG
-DEF SOLID_MAX     EQU T_WALL      ; tiles $60-$64 are solid
+DEF T_DIGIT0      EQU "0" - $20  ; font tile for '0'
 
 ; OAM slot assignments
-DEF OAM_PLAYER_HEAD EQU 0   ; OAM entry 0
-DEF OAM_PLAYER_BODY EQU 1   ; OAM entry 1
-DEF OAM_VULN0       EQU 2
-DEF OAM_VULN1       EQU 3
-DEF OAM_VULN2       EQU 4
-DEF OAM_EXP0        EQU 5
-DEF OAM_EXP1        EQU 6
-DEF OAM_EXP2        EQU 7
-DEF OAM_ADV0        EQU 8   ; advisory 0
-DEF OAM_ADV1        EQU 9
-DEF OAM_ADV2        EQU 10
-DEF OAM_ADV3        EQU 11
-DEF OAM_ADV4        EQU 12
+DEF OAM_PLAYER_HEAD EQU 0
+DEF OAM_PLAYER_BODY EQU 1
+DEF OAM_VULN0       EQU 2   ; 2-4
+DEF OAM_EXP0        EQU 5   ; 5-7
+DEF OAM_ADV0        EQU 8   ; 8-12
 DEF MAX_ADVISORIES  EQU 5
-DEF OAM_BOSS_HEAD   EQU 13  ; boss head sprite
-DEF OAM_BOSS_BODY   EQU 14  ; boss body sprite
+DEF OAM_BOSS_HEAD   EQU 13
 DEF BOSS_MAX_HP     EQU 3   ; hits to defeat Patch
 
-; Scan animation
-DEF SCAN_FRAMES     EQU 32  ; total frames for scan animation
-DEF SCAN_RANGE      EQU 80  ; pixels the beam reaches
+; Scan beam
+DEF SCAN_FRAMES     EQU 32  ; total frames a scan lasts
+DEF SCAN_TILES      EQU 10  ; max beam length in tiles
+DEF SCAN_REACH      EQU 20  ; px: how close to a vuln node a scan/exploit works
 
-; LCD values
-; LCD modes:
-;  TEXT = BG + window, no sprites (title, intro, dialog)
+; LCD / window
+;  TEXT = BG + window, no sprites (title, intro, map, full-screen messages)
 ;  PLAY = BG + window + sprites (platformer gameplay)
 DEF LCD_TEXT        EQU LCDCF_ON | LCDCF_BG8000 | LCDCF_BGON | LCDCF_WINON | LCDCF_WIN9C00
 DEF LCD_PLAY        EQU LCD_TEXT | LCDCF_OBJON
-DEF LCD_ON_WIN      EQU LCD_TEXT
+DEF WY_HIDDEN       EQU 144
+DEF WY_HUD          EQU 128         ; window rows 0-1 = HUD
+DEF WY_DIALOG       EQU 80          ; window rows 0-7 = HUD + dialog panel
+DEF DLG_ROWS        EQU 6           ; dialog text rows (window rows 2-7)
 
-; ---------------------------------------------------------------------------
-; Audio registers (hardware.inc only has NR1x + NR50/51/52)
-; ---------------------------------------------------------------------------
-DEF rNR21  EQU $FF16   ; CH2 duty / length
-DEF rNR22  EQU $FF17   ; CH2 envelope
-DEF rNR23  EQU $FF18   ; CH2 freq lo
-DEF rNR24  EQU $FF19   ; CH2 freq hi / trigger
-DEF rNR41  EQU $FF20   ; CH4 length
-DEF rNR42  EQU $FF21   ; CH4 envelope
-DEF rNR43  EQU $FF22   ; CH4 polynomial counter
-DEF rNR44  EQU $FF23   ; CH4 trigger
+; HUD digit positions in the window tilemap
+DEF HUD_HP_ADDR     EQU $9C23
+DEF HUD_VULNS_ADDR  EQU $9C2B
+DEF HUD_EXP_ADDR    EQU $9C31
+
+; VRAM write queue (entries of: addr lo, addr hi, tile)
+DEF VQ_MAX          EQU 24
+
+; Cartridge (MBC1)
+DEF rROMB           EQU $2000
+DEF rRAMG           EQU $0000
+DEF RAMG_ENABLE     EQU $0A
 
 ; Music song IDs (stored in wMusicSong)
 DEF SONG_OFF    EQU 0
@@ -168,146 +168,138 @@ DEF SONG_BOSS   EQU 3
 ; Special: $FF = rest, $FE = tie (hold previous)
 ; Tempo: frames per row stored in song header
 
+; Jump to MainLoop if a call above changed the game state (e.g. opened a
+; dialog or finished the level), so the rest of this frame's update is skipped.
+MACRO JP_UNLESS_STATE
+    ld      a, [wGameState]
+    cp      \1
+    jp      nz, MainLoop
+ENDM
+
 ; ---------------------------------------------------------------------------
 ; WRAM layout
 ; ---------------------------------------------------------------------------
-SECTION "WRAM", WRAM0[$C000]
-wGameState:      DS 1   ; $C000
-wIsGBC:          DS 1   ; $C001
-wFrame:          DS 1   ; $C002
+SECTION "WRAM", WRAM0
+wGameState:      DS 1
+wIsGBC:          DS 1   ; A at boot: $11 = GBC
+wFrame:          DS 1
 
 ; Player
-wPX:             DS 1   ; $C003  player X pixel (screen space 0-152)
-wPY:             DS 1   ; $C004  player Y pixel (screen space 0-127)
-wPVX:            DS 1   ; $C005  velocity X signed byte
-wPVY:            DS 1   ; $C006  velocity Y signed byte
-wPFacing:        DS 1   ; $C007  0=right 1=left
-wPOnGround:      DS 1   ; $C008
-wPAnimFrame:     DS 1   ; $C009
-wPAnimTimer:     DS 1   ; $C00A
+wPX:             DS 1   ; player X pixel (screen space 0-152)
+wPXSub:          DS 1   ; X fraction, 1/16 px (0-15)
+wPY:             DS 1   ; player Y pixel (screen space 0-127)
+wPVX:            DS 1   ; velocity X, signed, 1/16 px per frame
+wPVY:            DS 1   ; velocity Y, signed, px per frame
+wPFacing:        DS 1   ; 0=right 1=left
+wPOnGround:      DS 1
+wCoyote:         DS 1   ; frames left in which a ledge jump is still allowed
+wJumpBuf:        DS 1   ; frames left on a buffered jump press
+wInvuln:         DS 1   ; i-frames remaining after taking damage
+wHealth:         DS 1
+wPlayerDown:     DS 1   ; set when HP hits 0; handled at the top of the next frame
+wSpawnGrace:     DS 1   ; frames after a zone load before enemies can hit
 
-; Camera / zone
-wZone:           DS 1   ; $C00B  current zone (0-5)
-wCamX:           DS 1   ; $C00C  camera X (= zone_col * 8 offset, 0 for now)
-wCamY:           DS 1   ; $C00D
+wZone:           DS 1   ; current zone
 
 ; Input
-wJoypad:         DS 1   ; $C00E
-wJoypadPrev:     DS 1   ; $C00F
-wJoypadNew:      DS 1   ; $C010
+wJoypad:         DS 1
+wJoypadPrev:     DS 1
+wJoypadNew:      DS 1
 
-; Game progress
-wVulnScanned:    DS 1   ; $C011  bitmask bits 0-2
-wVulnExploited:  DS 1   ; $C012  bitmask bits 0-2
-wExploitSpawned: DS 1   ; $C013  bitmask bits 0-2 (exploit item in world)
-wExploitHeld:    DS 1   ; $C014  0=none, 1/2/3 = which one
-wHealth:         DS 1   ; $C015
+; Level progress (bit N = vuln/exploit N)
+wVulnScanned:    DS 1
+wVulnExploited:  DS 1
+wExploitSpawned: DS 1   ; exploit item is lying in the world
+wExploitHeld:    DS 1   ; 0=none, N = exploit for vuln N-1
 
-; Scan animation
-wScanActive:     DS 1   ; $C016
-wScanTimer:      DS 1   ; $C017
-wScanVulnIdx:    DS 1   ; $C018
-wScanX:          DS 1   ; $C019  screen X where beam starts
-wScanBeamLen:    DS 1   ; $C01A  current beam length in tiles
+; Scan beam
+wScanActive:     DS 1
+wScanTimer:      DS 1
+wScanVulnIdx:    DS 1
+wScanDir:        DS 1   ; 0=right 1=left
+wScanRow:        DS 1   ; beam tile row
+wScanCol:        DS 1   ; tile col the beam starts next to (player centre)
+wBeamLen:        DS 1   ; tiles drawn so far
+wBeamMax:        DS 1   ; tiles before the beam hits something solid
 
-; Dialog
-wDialogActive:   DS 1   ; $C01B
-wDialogLine1:    DS 2   ; $C01C-$C01D  pointer to line1 string
-wDialogLine2:    DS 2   ; $C01E-$C01F  pointer to line2 string
+; Dialog panel
+wDlgRow:         DS 1   ; next row to stream; DLG_ROWS = panel fully drawn
 
-; Intro
-wIntroPage:      DS 1   ; $C020
-
-; Timer (frames elapsed since game start, 16-bit)
-wTimerLo:        DS 1   ; $C021  low byte
-wTimerHi:        DS 1   ; $C022  high byte
+wIntroPage:      DS 1
 
 ; Multi-level progress
-wCurrentLevel:   DS 1   ; $C023  active level index (0-4)
-wMapCursor:      DS 1   ; $C024  world map cursor (0-4)
-wLevelComplete:  DS 1   ; $C025  bitmask bits 0-4 completed levels
+wCurrentLevel:   DS 1   ; active level index (0-4)
+wMapCursor:      DS 1   ; world map cursor (0-4)
+wLevelComplete:  DS 1   ; bitmask bits 0-4 completed levels (saved)
+
 ; Per-level runtime state (populated by InitLevel from LevelTable)
-wNumZones:       DS 1   ; $C026  number of zones in current level
-wNumVulns:       DS 1   ; $C027  number of vulns in current level (1=2vulns 0=3vulns if bit)
-wLvlZoneTableLo: DS 1   ; $C028  zone table ptr lo
-wLvlZoneTableHi: DS 1   ; $C029  zone table ptr hi
-wLvlAdjTableLo:  DS 1   ; $C02A  adj table ptr lo
-wLvlAdjTableHi:  DS 1   ; $C02B  adj table ptr hi
-; Vuln positions (zone/row/col) for up to 3 vulns
-wVuln0Zone:      DS 1   ; $C02C
-wVuln0Row:       DS 1   ; $C02D
-wVuln0Col:       DS 1   ; $C02E
-wVuln1Zone:      DS 1   ; $C02F
-wVuln1Row:       DS 1   ; $C030
-wVuln1Col:       DS 1   ; $C031
-wVuln2Zone:      DS 1   ; $C032
-wVuln2Row:       DS 1   ; $C033
-wVuln2Col:       DS 1   ; $C034
-; Exploit spawn positions (zone/row/col) for up to 3 exploits
-wExp0Zone:       DS 1   ; $C035
-wExp0Row:        DS 1   ; $C036
-wExp0Col:        DS 1   ; $C037
-wExp1Zone:       DS 1   ; $C038
-wExp1Row:        DS 1   ; $C039
-wExp1Col:        DS 1   ; $C03A
-wExp2Zone:       DS 1   ; $C03B
-wExp2Row:        DS 1   ; $C03C
-wExp2Col:        DS 1   ; $C03D
-; Start position
-wLvlStartZone:   DS 1   ; $C03E
-wLvlStartX:      DS 1   ; $C03F
-wLvlStartY:      DS 1   ; $C040
+wNumZones:       DS 1
+wNumVulns:       DS 1
+wLvlZoneTable:   DS 2   ; zone tilemap pointer table
+wLvlAdjTable:    DS 2   ; zone adjacency table
+wVulns:          DS MAX_VULNS * 3   ; zone, row, col per vuln node
+wExps:           DS MAX_VULNS * 3   ; zone, row, col per exploit spawn
+wVulnsEnd:
+wLvlStartZone:   DS 1
+wLvlStartX:      DS 1
+wLvlStartY:      DS 1
 
-; Advisory enemy state — up to 5 advisories (X, Y, VX, Zone = 4 bytes × 5 = 20 bytes)
-wAdvCount:       DS 1   ; $C041  number of active advisories this level (0-5)
-wAdv0X:          DS 1   ; $C042
-wAdv0Y:          DS 1   ; $C043
-wAdv0VX:         DS 1   ; $C044  velocity: 1=right, 255=left
-wAdv0Zone:       DS 1   ; $C045  zone this advisory patrols
-wAdv1X:          DS 1   ; $C046
-wAdv1Y:          DS 1   ; $C047
-wAdv1VX:         DS 1   ; $C048
-wAdv1Zone:       DS 1   ; $C049
-wAdv2X:          DS 1   ; $C04A
-wAdv2Y:          DS 1   ; $C04B
-wAdv2VX:         DS 1   ; $C04C
-wAdv2Zone:       DS 1   ; $C04D
-wAdv3X:          DS 1   ; $C04E
-wAdv3Y:          DS 1   ; $C04F
-wAdv3VX:         DS 1   ; $C050
-wAdv3Zone:       DS 1   ; $C051
-wAdv4X:          DS 1   ; $C052
-wAdv4Y:          DS 1   ; $C053
-wAdv4VX:         DS 1   ; $C054
-wAdv4Zone:       DS 1   ; $C055
-wAdvHit:         DS 1   ; $C056  set to 1 when player touches an advisory; cleared at top of UpdatePlay
-wSpawnGrace:     DS 1   ; $C057  frames of invincibility after zone load; counts down each frame
-; Boss state
-wBossX:          DS 1   ; $C058
-wBossVX:         DS 1   ; $C059  1=right 255=left
-wBossHP:         DS 1   ; $C05A
-wBossHitTimer:   DS 1   ; $C05B
-wKonamiStep:     DS 1   ; $C05C  Konami code progress (0-9); 10 = complete
+; Advisories: X, Y, VX (1=right 255=left), Zone — 4 bytes each
+wAdvCount:       DS 1
+wAdv0X:          DS MAX_ADVISORIES * 4
 
-; Music engine state
-wMusicSong:      DS 1   ; $C05D  current song: 0=off 1=title 2=play 3=boss
-wMusicRow:       DS 1   ; $C05E  current row in pattern
-wMusicTick:      DS 1   ; $C05F  tick-within-row counter
-wMusicPatIdx:    DS 1   ; $C060  current pattern index in song order
-wMusicTempoRel:  DS 1   ; $C061  frames per tick (set per song)
-wMusicCH1Duty:   DS 1   ; $C062  last CH1 duty/len written (for retriggering)
+; Boss
+wBossX:          DS 1
+wBossVX:         DS 1   ; 1=right 255=left
+wBossHP:         DS 1
+wBossHitTimer:   DS 1   ; flashes the boss after a hit
+wKonamiStep:     DS 1   ; Konami code progress (0-9)
+
+; Music
+wMusicSong:      DS 1   ; current song: 0=off 1=title 2=play 3=boss
+wMusicRow:       DS 1   ; current row in pattern
+wMusicTick:      DS 1   ; tick-within-row counter
+wMusicPatIdx:    DS 1   ; current pattern index in song order
+wMusicTempoRel:  DS 1   ; frames per tick (set per song)
+
+wVQCount:        DS 1   ; queued VRAM writes
+
+wZoneMap:        DS ZONE_SIZE               ; WRAM mirror of the zone tilemap
+wDlgBuf:         DS DLG_ROWS * ZONE_COLS    ; dialog panel tiles
+
+SECTION "VRAMQueue", WRAM0, ALIGN[8]
+wVQueue:         DS VQ_MAX * 3
 
 ; OAM shadow buffer (40 entries × 4 bytes)
-SECTION "OAMBuf", WRAM0[$C100]
+SECTION "OAMBuf", WRAM0, ALIGN[8]
 wOAMBuf:         DS 160
 
+; ---------------------------------------------------------------------------
+; Battery-backed save RAM
+; ---------------------------------------------------------------------------
+SECTION "SaveData", SRAM
+sMagic:          DS 4
+sLevelComplete:  DS 1
+sChecksum:       DS 1   ; ~sLevelComplete
+
 
 ; ---------------------------------------------------------------------------
-; Interrupt / RST vectors $0000-$00FF — claim this space so linker cannot
-; place floating ROM sections here (which would corrupt tile load addresses).
+; RST / interrupt vectors $0000-$00FF — claim this space so the linker cannot
+; place floating ROM sections here.
 ; ---------------------------------------------------------------------------
-SECTION "Vectors", ROM0[$0000]
-    DS $100     ; padding — RSTs and VBlank/LCD/Timer/Serial/Joypad vectors
+SECTION "RSTVectors", ROM0[$0000]
+    DS $40, $00
+
+SECTION "VBlankVector", ROM0[$0040]
+VBlankHandler:
+    push    af
+    ld      a, 1
+    ldh     [hVBlankFlag], a
+    pop     af
+    reti
+
+SECTION "OtherVectors", ROM0[$0048]
+    DS $100 - $48, $00
 
 ; ---------------------------------------------------------------------------
 ; ROM Header $0100-$014F
@@ -324,9 +316,9 @@ SECTION "Header", ROM0[$100]
     DB $80                  ; $0143 GBC-enhanced, DMG-compatible
     DB $00,$00              ; $0144-$0145 new licensee
     DB $00                  ; $0146 SGB flag
-    DB $01                  ; $0147 cart type: MBC1, no RAM
+    DB $03                  ; $0147 cart type: MBC1 + RAM + battery
     DB $01                  ; $0148 ROM: 64KB (4 banks)
-    DB $00                  ; $0149 RAM: none
+    DB $02                  ; $0149 RAM: 8KB
     DB $01                  ; $014A non-Japanese
     DB $33                  ; $014B old licensee
     DB $01                  ; $014C version
@@ -334,11 +326,12 @@ SECTION "Header", ROM0[$100]
     DW $0000                ; $014E-$014F global checksum
 
 ; ---------------------------------------------------------------------------
-; HRAM — DMA routine + GBC flag slot
+; HRAM
 ; ---------------------------------------------------------------------------
-SECTION "HRAM", HRAM[$FF80]
-hGBCFlag:   DS 1            ; $FF80 — A at boot ($11=GBC $01=DMG)
-hDMA:       DS 12           ; $FF81-$FF8C — OAM DMA routine copy
+SECTION "HRAM", HRAM
+hGBCFlag:    DS 1           ; A at boot ($11=GBC $01=DMG)
+hVBlankFlag: DS 1           ; set by the VBlank ISR
+hDMA:        DS 12          ; OAM DMA routine copy
 
 ; ---------------------------------------------------------------------------
 ; Entry Point $0150
@@ -348,10 +341,10 @@ SECTION "EntryPoint", ROM0[$150]
 EntryPoint:
     di
     ; Save GBC flag in HRAM before anything clobbers A
-    ld      [$FF80], a
+    ldh     [hGBCFlag], a
     ld      sp, $FFFE
 
-    ; Turn LCD off — wait for VBlank first
+    ; Turn LCD off — wait for VBlank first (interrupts are not running yet)
 .waitVBLoff:
     ld      a, [rLY]
     cp      144
@@ -373,59 +366,39 @@ EntryPoint:
     ld      [rVBK], a
     ld      hl, $8000
     ld      bc, $2000
-.zeroVRAM0:
-    ld      [hl+], a
-    dec     bc
-    ld      a, b
-    or      c
-    ld      a, 0
-    jr      nz, .zeroVRAM0
+    call    ZeroMem
 
     ; Zero VRAM bank 1 ($8000-$9FFF) — GBC attribute map (palette/flip/bank)
     ; Must be zeroed or tiles use random palettes from boot ROM
     ld      a, 1
     ld      [rVBK], a
-    xor     a               ; A must be 0 before entering loop (rVBK write leaves A=1)
     ld      hl, $8000
     ld      bc, $2000
-.zeroVRAM1:
-    ld      [hl+], a        ; a=0 (set by ld a,0 at end of loop; first iter uses xor a below)
-    dec     bc
-    ld      a, b
-    or      c
-    ld      a, 0
-    jr      nz, .zeroVRAM1
-    ; Switch back to bank 0
+    call    ZeroMem
     xor     a
     ld      [rVBK], a
 
     ; Zero WRAM ($C000-$DFFF)
     ld      hl, $C000
     ld      bc, $2000
-    xor     a
-.zeroWRAM:
-    ld      [hl+], a
-    dec     bc
-    ld      a, b
-    or      c
-    ld      a, 0
-    jr      nz, .zeroWRAM
+    call    ZeroMem
 
     ; Now WRAM is clean — restore GBC flag and init variables
-    ld      a, [$FF80]
+    ldh     a, [hGBCFlag]
     ld      [wIsGBC], a
     ld      a, STATE_TITLE
     ld      [wGameState], a
-    ld      a, 5
+    ld      a, MAX_HEALTH
     ld      [wHealth], a
+    call    LoadSave
 
     ; Scroll = 0
     xor     a
     ld      [rSCX], a
     ld      [rSCY], a
 
-    ; Window off-screen initially (push below visible area)
-    ld      a, 160
+    ; Window off-screen until gameplay
+    ld      a, WY_HIDDEN
     ld      [rWY], a
     ld      a, 7
     ld      [rWX], a
@@ -438,15 +411,13 @@ EntryPoint:
 
     ; Copy DMA routine to HRAM
     ld      hl, DMARoutine
-    ld      de, $FF81
-    ld      bc, DMARoutineEnd - DMARoutine
+    ld      de, hDMA
+    ld      b, DMARoutineEnd - DMARoutine
 .copyDMA:
     ld      a, [hl+]
     ld      [de], a
     inc     de
-    dec     bc
-    ld      a, b
-    or      c
+    dec     b
     jr      nz, .copyDMA
 
     ; Load tile + font + sprite data into VRAM (LCD is OFF)
@@ -455,7 +426,7 @@ EntryPoint:
     ; Setup GBC colour palettes
     call    SetupPalettes
 
-    ; Draw title screen into tilemap (LCD stays OFF inside, turned on at end)
+    ; Draw title screen into tilemap (turns the LCD on at the end)
     call    DrawTitleScreen
 
     ; Seed joypad
@@ -467,14 +438,24 @@ EntryPoint:
     ld      a, SONG_TITLE
     call    MusicPlay
 
+    ; VBlank interrupt drives frame sync from here on
+    ld      a, IEF_VBLANK
+    ld      [rIE], a
+    xor     a
+    ld      [rIF], a
+    ei
+
 ; ===========================================================================
 ;  Main Loop
 ; ===========================================================================
 MainLoop:
     call    WaitVBlank
-    ; DMA OAM every frame — wOAMBuf is zeroed at boot so Y=0 entries are off-screen
-    ld      a, $C1          ; high byte of wOAMBuf ($C100)
-    call    $FF81           ; hDMA
+    ; --- VBlank-only work: keep this block short ---
+    ld      a, HIGH(wOAMBuf)
+    call    hDMA
+    call    FlushVRAMQueue
+    call    StreamDialogRow
+    ; --- the rest of the frame can run during active display ---
     call    ReadJoypad
     call    MusicTick
     ld      a, [wFrame]
@@ -496,21 +477,23 @@ MainLoop:
     jp      z, UpdatePatchedScreen
     cp      STATE_BOSS
     jp      z, UpdateBossScreen
-    ; STATE_WIN — freeze
-    jr      MainLoop
+    jp      UpdateWin
 
 ; ===========================================================================
-;  WaitVBlank — two-phase LY poll (fresh edge)
+;  WaitVBlank — sleep until the VBlank ISR fires.
+;  Returns immediately if the LCD is off (no VBlank interrupts then).
 ; ===========================================================================
 WaitVBlank:
-.notVBL:
-    ld      a, [rLY]
-    cp      144
-    jr      nc, .notVBL
-.waitVBL:
-    ld      a, [rLY]
-    cp      144
-    jr      c, .waitVBL
+    ld      a, [rLCDC]
+    bit     7, a
+    ret     z
+    xor     a
+    ldh     [hVBlankFlag], a
+.wait:
+    halt
+    ldh     a, [hVBlankFlag]
+    or      a
+    jr      z, .wait
     ret
 
 ; ===========================================================================
@@ -535,6 +518,222 @@ LCDOn:
 LCDOnPlay:
     ld      a, LCD_PLAY
     ld      [rLCDC], a
+    ret
+
+; ZeroMem — zero BC bytes at HL
+ZeroMem:
+    xor     a
+    ld      [hl+], a
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, ZeroMem
+    ret
+
+; ===========================================================================
+;  VRAM write queue
+;  Game logic runs outside VBlank, where VRAM is not reliably accessible, so
+;  tile changes during gameplay are queued and written at the start of the
+;  next VBlank by FlushVRAMQueue.
+; ===========================================================================
+
+; QueueTile — HL = VRAM address, A = tile. Preserves BC, DE, HL.
+; Writes straight through when the LCD is off.
+QueueTile:
+    push    bc
+    push    de
+    ld      c, a
+    ld      a, [rLCDC]
+    bit     7, a
+    jr      nz, .lcdOn
+    ld      [hl], c
+    jr      .done
+.lcdOn:
+    ld      a, [wVQCount]
+    cp      VQ_MAX
+    jr      c, .room
+    ; Queue full — drain it in the next VBlank, then carry on
+    push    hl
+    call    WaitVBlank
+    call    FlushVRAMQueue
+    pop     hl
+    xor     a
+.room:
+    ld      b, a
+    inc     a
+    ld      [wVQCount], a
+    ld      a, b
+    add     a, a
+    add     a, b            ; slot * 3
+    ld      e, a
+    ld      d, HIGH(wVQueue)
+    ld      a, l
+    ld      [de], a
+    inc     e
+    ld      a, h
+    ld      [de], a
+    inc     e
+    ld      a, c
+    ld      [de], a
+.done:
+    pop     de
+    pop     bc
+    ret
+
+; FlushVRAMQueue — call during VBlank only
+FlushVRAMQueue:
+    ld      a, [wVQCount]
+    or      a
+    ret     z
+    ld      b, a
+    ld      hl, wVQueue
+.loop:
+    ld      a, [hl+]
+    ld      e, a
+    ld      a, [hl+]
+    ld      d, a
+    ld      a, [hl+]
+    ld      [de], a
+    dec     b
+    jr      nz, .loop
+    xor     a
+    ld      [wVQCount], a
+    ret
+
+; ===========================================================================
+;  Tilemap addressing
+; ===========================================================================
+
+; GetTileAddr — D=row E=col → HL = BG map VRAM address. Clobbers BC.
+GetTileAddr:
+    ld      a, d
+    ld      h, 0
+    ld      l, a
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl
+    add     hl, hl          ; row * 32
+    ld      a, e
+    ld      b, 0
+    ld      c, a
+    add     hl, bc
+    ld      bc, $9800
+    add     hl, bc
+    ret
+
+; GetMapAddr — D=row E=col → HL = &wZoneMap[row*20 + col]. Clobbers BC.
+GetMapAddr:
+    ld      a, d
+    ld      h, 0
+    ld      l, a
+    add     hl, hl
+    add     hl, hl          ; row * 4
+    ld      b, h
+    ld      c, l
+    add     hl, hl
+    add     hl, hl          ; row * 16
+    add     hl, bc          ; row * 20
+    ld      a, e
+    ld      b, 0
+    ld      c, a
+    add     hl, bc
+    ld      bc, wZoneMap
+    add     hl, bc
+    ret
+
+; GetTile — D=row E=col → A = tile ID. Preserves DE.
+; Outside the zone: rows below are solid, columns past either side are open
+; (the side passages lead off-screen).
+GetTile:
+    ld      a, d
+    cp      ZONE_ROWS
+    jr      nc, .below
+    ld      a, e
+    cp      ZONE_COLS
+    jr      nc, .side
+    push    bc
+    call    GetMapAddr
+    pop     bc
+    ld      a, [hl]
+    ret
+.below:
+    ld      a, T_WALL
+    ret
+.side:
+    ld      a, T_VOID
+    ret
+
+; SetMapTile — D=row E=col A=tile. Updates the WRAM map and queues the
+; matching VRAM write. Preserves DE.
+SetMapTile:
+    push    bc
+    push    af
+    call    GetMapAddr
+    pop     af
+    ld      [hl], a
+    push    af
+    call    GetTileAddr
+    pop     af
+    pop     bc
+    jp      QueueTile
+
+; IsSolid — A = tile ID → NZ if solid (platforms and walls), Z if passable.
+IsSolid:
+    sub     T_PLAT_MID
+    cp      T_WALL - T_PLAT_MID + 1
+    sbc     a, a            ; $FF if solid, $00 if not
+    ret
+
+; ===========================================================================
+;  Index helpers for the per-vuln arrays
+; ===========================================================================
+
+; IndexToMask — A = 0-7 → A = 1 << A. Preserves BC, DE, HL.
+IndexToMask:
+    push    hl
+    ld      hl, MaskTable
+    add     a, l
+    ld      l, a
+    adc     a, h
+    sub     l
+    ld      h, a
+    ld      a, [hl]
+    pop     hl
+    ret
+
+MaskTable:
+    DB $01, $02, $04, $08, $10, $20, $40, $80
+
+; VulnPtr / ExpPtr — A = index → HL = &wVulns[A] / &wExps[A] (zone, row, col).
+; Preserve BC, DE.
+VulnPtr:
+    ld      hl, wVulns
+    jr      IndexTriple
+ExpPtr:
+    ld      hl, wExps
+IndexTriple:
+    push    bc
+    ld      c, a
+    add     a, a
+    add     a, c
+    ld      c, a
+    ld      b, 0
+    add     hl, bc
+    pop     bc
+    ret
+
+; DistToCol — A = tile col → A = |wPX - col*8|. Clobbers D.
+DistToCol:
+    add     a, a
+    add     a, a
+    add     a, a
+    ld      d, a
+    ld      a, [wPX]
+    sub     d
+    ret     nc
+    cpl
+    inc     a
     ret
 
 ; ===========================================================================
@@ -589,6 +788,8 @@ DMARoutineEnd:
 DrawTitleScreen:
     call    LCDOff
     call    ClearBG
+    ld      a, WY_HIDDEN
+    ld      [rWY], a
     ld      hl, $9840       ; row 2
     ld      de, StrTitle1
     call    PrintStr
@@ -601,12 +802,31 @@ DrawTitleScreen:
     ld      hl, $9900       ; row 8
     ld      de, StrTitlePrompt
     call    PrintStr
+    ; Offer to wipe the save only when there is one
+    ld      a, [wLevelComplete]
+    or      a
+    jr      z, .noSave
+    ld      hl, $9A00       ; row 16
+    ld      de, StrTitleErase
+    call    PrintStr
+.noSave:
     call    LCDOn           ; BG + window, no sprites
     ret
 
 UpdateTitle:
     ld      a, [wJoypadNew]
-    bit     3, a            ; Start
+    bit     PADB_SELECT, a
+    jr      z, .noErase
+    ld      a, [wLevelComplete]
+    or      a
+    jp      z, MainLoop
+    xor     a
+    ld      [wLevelComplete], a
+    call    WriteSave
+    call    DrawTitleScreen
+    jp      MainLoop
+.noErase:
+    bit     PADB_START, a
     jp      z, MainLoop
     ld      a, STATE_INTRO
     ld      [wGameState], a
@@ -614,6 +834,61 @@ UpdateTitle:
     ld      [wIntroPage], a
     call    DrawIntroPage
     jp      MainLoop
+
+; ===========================================================================
+;  Save data — wLevelComplete in battery-backed cartridge RAM
+; ===========================================================================
+LoadSave:
+    ld      a, RAMG_ENABLE
+    ld      [rRAMG], a
+    ld      hl, sMagic
+    ld      de, SaveMagic
+    ld      b, 4
+.check:
+    ld      a, [de]
+    cp      [hl]
+    jr      nz, .done       ; blank or foreign SRAM — keep defaults
+    inc     hl
+    inc     de
+    dec     b
+    jr      nz, .check
+    ld      a, [sLevelComplete]
+    ld      b, a
+    cpl
+    ld      c, a
+    ld      a, [sChecksum]
+    cp      c
+    jr      nz, .done
+    ld      a, b
+    and     ALL_LEVELS
+    ld      [wLevelComplete], a
+.done:
+    xor     a
+    ld      [rRAMG], a
+    ret
+
+WriteSave:
+    ld      a, RAMG_ENABLE
+    ld      [rRAMG], a
+    ld      hl, sMagic
+    ld      de, SaveMagic
+    ld      b, 4
+.magic:
+    ld      a, [de]
+    ld      [hl+], a
+    inc     de
+    dec     b
+    jr      nz, .magic
+    ld      a, [wLevelComplete]
+    ld      [sLevelComplete], a
+    cpl
+    ld      [sChecksum], a
+    xor     a
+    ld      [rRAMG], a
+    ret
+
+SaveMagic:
+    DB "SE01"
 
 ; ===========================================================================
 ;  INTRO — 3 pages, A advances
@@ -703,51 +978,54 @@ UpdateIntro:
     call    DrawMapScreen
     jp      MainLoop
 
-; ===========================================================================
-;  INIT PLATFORMER — now delegates to InitLevel(0)
-; ===========================================================================
-InitPlay:
-    xor     a
-    call    InitLevel
-    ret
 
 ; ===========================================================================
-;  LOAD ZONE — copy zone tilemap to VRAM $9800, reset camera
+;  LOAD ZONE — build the WRAM map for wZone, then copy it to VRAM $9800
 ; ===========================================================================
 LoadZone:
     call    LCDOff          ; safe — checks bit 7 first, waits for VBlank
-    ; Get zone data pointer from per-level zone table (stored in WRAM)
-    ld      a, [wZone]
-    ld      a, [wLvlZoneTableLo]
+    ; DE = zone data pointer from the per-level zone table
+    ld      a, [wLvlZoneTable]
     ld      l, a
-    ld      a, [wLvlZoneTableHi]
-    ld      h, a            ; HL = zone table base
+    ld      a, [wLvlZoneTable + 1]
+    ld      h, a
     ld      a, [wZone]
     add     a, a            ; *2 for DW entries
-    ld      b, 0
     ld      c, a
+    ld      b, 0
     add     hl, bc
     ld      a, [hl+]
     ld      e, a
-    ld      a, [hl]
-    ld      d, a            ; DE = zone data pointer
+    ld      d, [hl]
 
-    ; Copy zone data (20 cols × 16 rows) into VRAM tilemap (32 cols wide).
-    ; Each row: copy 20 tiles from zone data, then advance HL by 12 to skip
-    ; the unused right 12 columns of the 32-wide VRAM row.
+    ; ROM zone data → WRAM mirror
+    ld      hl, wZoneMap
+    ld      bc, ZONE_SIZE
+.copyMap:
+    ld      a, [de]
+    ld      [hl+], a
+    inc     de
+    dec     bc
+    ld      a, b
+    or      c
+    jr      nz, .copyMap
+
+    call    ApplyZoneOverlays
+
+    ; WRAM mirror (20 cols × 16 rows) → VRAM tilemap (32 cols wide)
+    ld      de, wZoneMap
     ld      hl, $9800
-    ld      b, ZONE_ROWS        ; 16 rows
+    ld      b, ZONE_ROWS
 .copyRow:
-    ld      c, ZONE_COLS        ; 20 tiles per row
+    ld      c, ZONE_COLS
 .copyTile:
     ld      a, [de]
     ld      [hl+], a
     inc     de
     dec     c
     jr      nz, .copyTile
-    ; Skip the remaining 12 columns in VRAM (32 - 20 = 12)
     ld      a, l
-    add     12
+    add     32 - ZONE_COLS
     ld      l, a
     jr      nc, .noCarry
     inc     h
@@ -755,338 +1033,361 @@ LoadZone:
     dec     b
     jr      nz, .copyRow
 
-    ; Place exploit pickup tiles (VRAM write — LCD still OFF)
-    call    PlaceExploitTiles
+    ; Anything still queued was aimed at the previous screen
+    xor     a
+    ld      [wVQCount], a
+    ld      [wScanActive], a
+    ld      [wBeamLen], a
 
     ; Write HUD to window tilemap $9C00 (VRAM write — LCD still OFF)
     call    UpdateHUD
 
-    ; Reset scroll
     xor     a
     ld      [rSCX], a
     ld      [rSCY], a
-    ld      [wCamX], a
-    ld      [wCamY], a
+    ld      a, WY_HUD
+    ld      [rWY], a
 
-    ; Grace period — 60 frames before advisories can hit
-    ld      a, 60
+    ld      a, SPAWN_GRACE
     ld      [wSpawnGrace], a
 
     call    LCDOnPlay       ; turn LCD back on with sprites enabled
     ret
 
-; ===========================================================================
-;  PlaceExploitTiles — write T_EXPLOIT tile into tilemap if spawned + in zone
-; ===========================================================================
-PlaceExploitTiles:
-    ld      a, [wExploitSpawned]
-    ; Check exploit 0
-    bit     0, a
-    jr      z, .pet_chk1
-    ld      a, [wExp0Zone]
-    ld      b, a
-    ld      a, [wExp0Col]
-    ld      c, a
-    ld      a, [wExp0Row]
-    ld      d, a
-    call    PlaceTileIfZone
-.pet_chk1:
-    ld      a, [wExploitSpawned]
-    bit     1, a
-    jr      z, .pet_chk2
-    ld      a, [wExp1Zone]
-    ld      b, a
-    ld      a, [wExp1Col]
-    ld      c, a
-    ld      a, [wExp1Row]
-    ld      d, a
-    call    PlaceTileIfZone
-.pet_chk2:
-    ld      a, [wExploitSpawned]
-    bit     2, a
-    jr      z, .pet_done
-    ld      a, [wExp2Zone]
-    ld      b, a
-    ld      a, [wExp2Col]
-    ld      c, a
-    ld      a, [wExp2Row]
-    ld      d, a
-    call    PlaceTileIfZone
-.pet_done:
-    ret
-
-; PlaceTileIfZone: B=zone C=col D=row — write T_EXPLOIT if current zone matches
-PlaceTileIfZone:
+; ---------------------------------------------------------------------------
+;  ApplyZoneOverlays — stamp level progress onto wZoneMap: scanned and
+;  exploited vuln nodes, and exploit pickups still lying in this zone.
+; ---------------------------------------------------------------------------
+ApplyZoneOverlays:
+    ld      c, 0
+.loop:
+    ld      a, [wNumVulns]
+    cp      c
+    ret     z
+    ; Vuln node state
+    ld      a, c
+    call    VulnPtr
     ld      a, [wZone]
-    cp      b
-    ret     nz
-    ; Compute VRAM address: $9800 + row*32 + col
-    ld      a, d            ; row
-    ld      h, 0
-    ld      l, a
-    add     hl, hl          ; *2
-    add     hl, hl          ; *4
-    add     hl, hl          ; *8
-    add     hl, hl          ; *16
-    add     hl, hl          ; *32
-    ld      a, c            ; + col
-    ld      e, a
-    ld      d, 0
-    add     hl, de
-    ld      de, $9800
-    add     hl, de
+    cp      [hl]
+    jr      nz, .exploit
+    inc     hl
+    ld      a, [hl+]
+    ld      d, a            ; row
+    ld      e, [hl]         ; col
+    ld      a, c
+    call    IndexToMask
+    ld      b, a
+    ld      a, [wVulnExploited]
+    and     b
+    ld      a, T_VULN_EXP
+    jr      nz, .stampVuln
+    ld      a, [wVulnScanned]
+    and     b
+    jr      z, .exploit
+    ld      a, T_VULN_SCAN
+.stampVuln:
+    push    bc
+    push    af
+    call    GetMapAddr
+    pop     af
+    ld      [hl], a
+    pop     bc
+.exploit:
+    ; Spawned, uncollected exploit pickup
+    ld      a, c
+    call    IndexToMask
+    ld      b, a
+    ld      a, [wExploitSpawned]
+    and     b
+    jr      z, .next
+    ld      a, c
+    call    ExpPtr
+    ld      a, [wZone]
+    cp      [hl]
+    jr      nz, .next
+    inc     hl
+    ld      a, [hl+]
+    ld      d, a
+    ld      e, [hl]
+    push    bc
+    call    GetMapAddr
     ld      [hl], T_EXPLOIT
-    ret
+    pop     bc
+.next:
+    inc     c
+    jr      .loop
 
 ; ===========================================================================
-;  UpdateHUD — write HP / vulns / carry to window tilemap $9C00
+;  UpdateHUD — draw the whole HUD into window tilemap $9C00 (LCD off only)
+;  Row 0: "LN " + zone name     Row 1: HP:N VULNS:N EXP:N
 ; ===========================================================================
 UpdateHUD:
-    ; HUD occupies window tilemap $9C00, rows 0-1 (WY=128 = 2 rows at bottom)
-    ; Row 0: "LN " + zone name (where N = level number 1-5)
-    ; Row 1: HP:N  VULNS:N  EXP:N
-    ; Print "L" prefix
     ld      hl, $9C00
-    ld      [hl], $2C           ; tile for 'L' (ASCII $4C - $20 = $2C)
+    ld      [hl], "L" - $20
     inc     hl
     ld      a, [wCurrentLevel]
     inc     a                   ; display 1-based
-    add     a, $10              ; digit tile offset
-    ld      [hl], a
-    inc     hl
-    ld      [hl], $00           ; space (ASCII $20 - $20 = 0)
-    inc     hl
-    ; Now print zone name — use per-level zone name table
-    ; zone name table: ZoneNameTable covers level 0 zones (0-5)
-    ; LvlNZoneNames tables cover levels 1-4
+    add     a, T_DIGIT0
+    ld      [hl+], a
+    ld      [hl], T_SPACE
+    ; Zone name: LvlZoneNamesTable[level][zone]
     ld      a, [wCurrentLevel]
-    or      a
-    jr      nz, .notLvl0Name
-    ; Level 0: use original ZoneNameTable
-    ld      a, [wZone]
-    ld      de, ZoneNameTable
     add     a, a
+    ld      c, a
     ld      b, 0
-    ld      c, a
-    ; de + bc = table entry
-    ld      h, d
-    ld      l, e
-    add     hl, bc
-    ld      a, [hl+]
-    ld      e, a
-    ld      a, [hl]
-    ld      d, a
-    jr      .printName
-.notLvl0Name:
-    ; Levels 1-4: use LvlNZoneNames
-    ld      a, [wZone]
-    ld      b, a                ; save zone index
-    ld      a, [wCurrentLevel]
-    ; build pointer into LvlZoneNamesTable: table of DW pointers
-    dec     a                   ; 0-based level index (1→0, 2→1, etc)
-    add     a, a                ; *2
-    ld      c, a
-    ld      a, 0
-    ld      b, a
     ld      hl, LvlZoneNamesTable
-    add     hl, bc              ; HL = &table_ptr
+    add     hl, bc
     ld      a, [hl+]
-    ld      e, a
-    ld      a, [hl]
-    ld      d, a                ; DE = base of that level's zone name DW table
+    ld      h, [hl]
+    ld      l, a                ; HL = this level's zone name table
     ld      a, [wZone]
-    add     a, a                ; *2 for DW
-    ld      b, 0
+    add     a, a
     ld      c, a
-    ld      h, d
-    ld      l, e
     add     hl, bc
     ld      a, [hl+]
     ld      e, a
-    ld      a, [hl]
-    ld      d, a
-.printName:
-    ; DE = zone name string pointer, HL = $9C03
+    ld      d, [hl]
     ld      hl, $9C03
     call    PrintStrDirect
 
-    ; Row 1 — stats
+    ; Row 1 — labels, then the digits
     ld      hl, $9C20
     ld      de, StrHudHP
     call    PrintStrDirect
-    ld      a, [wHealth]
-    add     a, $10
-    ld      hl, $9C23
-    ld      [hl], a
     ld      hl, $9C24
     ld      de, StrHudVulns
     call    PrintStrDirect
-    ld      a, [wVulnExploited]
-    ; Count bits (max 3)
-    ld      b, 0
-    bit     0, a
-    jr      z, .hv1
-    inc     b
-.hv1:
-    bit     1, a
-    jr      z, .hv2
-    inc     b
-.hv2:
-    bit     2, a
-    jr      z, .hv3
-    inc     b
-.hv3:
-    ld      a, b
-    add     a, $10
-    ld      hl, $9C2B
-    ld      [hl], a
     ld      hl, $9C2C
     ld      de, StrHudCarry
     call    PrintStrDirect
+    ; fall through
+
+; QueueHUDStats — refresh the HP / VULNS / EXP digits. Safe at any time.
+; Preserves BC, DE.
+QueueHUDStats:
+    push    bc
+    ld      a, [wHealth]
+    add     a, T_DIGIT0
+    ld      hl, HUD_HP_ADDR
+    call    QueueTile
+    ; popcount of exploited vulns
+    ld      a, [wVulnExploited]
+    ld      b, T_DIGIT0
+.count:
+    or      a
+    jr      z, .counted
+    srl     a
+    jr      nc, .count
+    inc     b
+    jr      .count
+.counted:
+    ld      a, b
+    ld      hl, HUD_VULNS_ADDR
+    call    QueueTile
     ld      a, [wExploitHeld]
-    add     a, $10
-    ld      hl, $9C31
-    ld      [hl], a
+    add     a, T_DIGIT0
+    ld      hl, HUD_EXP_ADDR
+    call    QueueTile
+    pop     bc
     ret
 
 ; ===========================================================================
 ;  MAIN PLAY UPDATE
 ; ===========================================================================
 UpdatePlay:
-    ; --- Check advisory hit from previous frame ---
-    ld      a, [wAdvHit]
+    ld      a, [wPlayerDown]
     or      a
-    jr      z, .advHitDone
-    xor     a
-    ld      [wAdvHit], a
+    jr      z, .alive
     call    DrawPatchedScreen
     jp      MainLoop
-.advHitDone:
-    ; --- Tick spawn grace timer ---
-    ld      a, [wSpawnGrace]
-    or      a
-    jr      z, .graceDone
-    dec     a
-    ld      [wSpawnGrace], a
-.graceDone:
-    ; --- Increment timer (16-bit) ---
-    ld      a, [wTimerLo]
-    inc     a
-    ld      [wTimerLo], a
-    jr      nz, .timerDone
-    ld      a, [wTimerHi]
-    inc     a
-    ld      [wTimerHi], a
-.timerDone:
-    ; --- Input → physics ---
-    call    UpdatePlayerInput
-
-    ; --- Apply physics ---
+.alive:
+    call    TickPlayerTimers
+    call    UpdatePlayerInput       ; may open a dialog or finish the level
+    JP_UNLESS_STATE STATE_PLAY
     call    UpdatePlayerPhysics
-
-    ; --- Update scan animation ---
-    call    UpdateScan
-
-    ; --- Check pickup ---
-    call    CheckPickup
-
-    ; --- Update advisories ---
+    call    UpdateScan              ; may open the scan dialog
+    JP_UNLESS_STATE STATE_PLAY
+    call    CheckPickup             ; may open the pickup dialog
+    JP_UNLESS_STATE STATE_PLAY
     call    UpdateAdvisories
-
-    ; --- Check advisory collision ---
     call    CheckAdvisoryCollision
-
-    ; --- Update OAM shadow ---
     call    UpdateOAM
-
     jp      MainLoop
 
+; TickPlayerTimers — count down spawn grace and i-frames
+TickPlayerTimers:
+    ld      hl, wSpawnGrace
+    ld      a, [hl]
+    or      a
+    jr      z, .graceDone
+    dec     [hl]
+.graceDone:
+    ld      hl, wInvuln
+    ld      a, [hl]
+    or      a
+    ret     z
+    dec     [hl]
+    ret
+
+; ---------------------------------------------------------------------------
+;  DamagePlayer — B = attacker X. Costs 1 HP, knocks the player away from
+;  the attacker and starts i-frames. At 0 HP sets wPlayerDown.
+; ---------------------------------------------------------------------------
+DamagePlayer:
+    ld      a, [wInvuln]
+    or      a
+    ret     nz
+    ld      a, [wSpawnGrace]
+    or      a
+    ret     nz
+    ld      a, [wHealth]
+    dec     a
+    ld      [wHealth], a
+    jr      nz, .survived
+    ld      a, 1
+    ld      [wPlayerDown], a
+    jp      QueueHUDStats
+.survived:
+    ld      a, INVULN_FRAMES
+    ld      [wInvuln], a
+    ld      a, KNOCK_VY
+    ld      [wPVY], a
+    xor     a
+    ld      [wPOnGround], a
+    ld      [wCoyote], a
+    ld      a, [wPX]
+    cp      b
+    ld      a, KNOCK_VX             ; player right of attacker → push right
+    jr      nc, .setVX
+    ld      a, 256 - KNOCK_VX
+.setVX:
+    ld      [wPVX], a
+    jp      QueueHUDStats
+
 ; ===========================================================================
-;  UpdatePlayerInput — apply joystick to velocity
+;  UpdatePlayerInput — steering, jumping and the B action
 ; ===========================================================================
 UpdatePlayerInput:
-    ld      a, [wJoypad]
+    ; Knockback: steering is ignored for the first frames after a hit
+    ld      a, [wInvuln]
+    cp      INVULN_FRAMES - KNOCK_FRAMES + 1
+    jr      nc, .doneH
 
-    ; Left
-    bit     5, a
-    jr      z, .chkRight
-    ld      a, [wPVX]
-    sub     RUN_VX
-    ; Clamp to -RUN_VX (unsigned: >= 256-RUN_VX)
-    cp      256 - RUN_VX - 1
-    jr      c, .setVX_L
-    ld      a, 256 - RUN_VX
-.setVX_L:
-    ld      [wPVX], a
-    ld      a, 1
-    ld      [wPFacing], a
-    jr      .doneH
-.chkRight:
-    bit     4, a
-    jr      z, .noHoriz
-    ld      a, [wPVX]
-    add     RUN_VX
-    cp      RUN_VX + 1
-    jr      c, .setVX_R
-    ld      a, RUN_VX
-.setVX_R:
-    ld      [wPVX], a
-    xor     a
-    ld      [wPFacing], a
-    jr      .doneH
-.noHoriz:
-    ; Friction
+    ld      a, [wJoypad]
+    bit     PADB_LEFT, a
+    jr      nz, .left
+    bit     PADB_RIGHT, a
+    jr      nz, .right
+
+    ; No steering — friction toward 0
+    ld      b, AIR_FRIC
+    ld      a, [wPOnGround]
+    or      a
+    jr      z, .friction
+    ld      b, GROUND_FRIC
+.friction:
     ld      a, [wPVX]
     or      a
     jr      z, .doneH
-    ; Check sign: if >= 128, negative
-    cp      128
-    jr      nc, .negFric
-    ; Positive
-    sub     FRICTION
-    jr      nc, .setFric
+    bit     7, a
+    jr      nz, .fricNeg
+    sub     b
+    jr      nc, .setVX
     xor     a
-    jr      .setFric
-.negFric:
-    add     FRICTION
-    jr      c, .setFric     ; wrapped past 255 → zero
-    cp      128
-    jr      c, .zeroFric    ; if now positive, clamp to 0
-    jr      .setFric
-.zeroFric:
+    jr      .setVX
+.fricNeg:
+    add     b
+    jr      nc, .setVX              ; still negative
+    xor     a                       ; crossed zero
+    jr      .setVX
+
+.left:
+    ld      a, 1
+    ld      [wPFacing], a
+    ld      b, RUN_ACCEL
+    ld      a, [wPVX]
+    or      a
+    jr      z, .applyLeft
+    bit     7, a
+    jr      nz, .applyLeft
+    ld      b, RUN_ACCEL + GROUND_FRIC  ; moving right: brake harder
+.applyLeft:
+    sub     b
+    bit     7, a
+    jr      z, .setVX               ; still positive (braking)
+    cp      256 - RUN_MAX
+    jr      nc, .setVX
+    ld      a, 256 - RUN_MAX
+    jr      .setVX
+
+.right:
     xor     a
-.setFric:
+    ld      [wPFacing], a
+    ld      b, RUN_ACCEL
+    ld      a, [wPVX]
+    bit     7, a
+    jr      z, .applyRight
+    ld      b, RUN_ACCEL + GROUND_FRIC  ; moving left: brake harder
+.applyRight:
+    add     b
+    bit     7, a
+    jr      nz, .setVX              ; still negative (braking)
+    cp      RUN_MAX + 1
+    jr      c, .setVX
+    ld      a, RUN_MAX
+.setVX:
     ld      [wPVX], a
 .doneH:
-    ; Jump — A button
+
+    ; Jump — A press is buffered for a few frames, and a ledge jump is
+    ; still allowed for a few frames after walking off (coyote time)
     ld      a, [wJoypadNew]
-    bit     0, a            ; A
-    jr      z, .noJump
+    bit     PADB_A, a
+    jr      z, .noNewJump
+    ld      a, JUMP_BUF_FRAMES
+    ld      [wJumpBuf], a
+.noNewJump:
+    ld      a, [wJumpBuf]
+    or      a
+    jr      z, .jumpDone
     ld      a, [wPOnGround]
     or      a
-    jr      z, .noJump
+    jr      nz, .jump
+    ld      a, [wCoyote]
+    or      a
+    jr      z, .jumpDone
+.jump:
     ld      a, JUMP_VY
     ld      [wPVY], a
     xor     a
     ld      [wPOnGround], a
-.noJump:
+    ld      [wCoyote], a
+    ld      [wJumpBuf], a
+.jumpDone:
+    ; Variable jump height: releasing A cuts the rise short
+    ld      a, [wJoypad]
+    bit     PADB_A, a
+    jr      nz, .riseDone
+    ld      a, [wPVY]
+    cp      128
+    jr      c, .riseDone            ; not rising
+    cp      JUMP_CUT_VY
+    jr      nc, .riseDone           ; already slow
+    ld      a, JUMP_CUT_VY
+    ld      [wPVY], a
+.riseDone:
+
     ; B button — scan or exploit-use depending on context, grounded only
     ld      a, [wPOnGround]
     or      a
-    jr      z, .done        ; airborne — skip both
+    ret     z
     ld      a, [wJoypadNew]
-    bit     1, a            ; B
-    jr      z, .done
-    ; If holding an exploit, try to use it; otherwise try to scan
+    bit     PADB_B, a
+    ret     z
     ld      a, [wExploitHeld]
     or      a
-    jr      nz, .doUse
-    call    TryScan
-    jr      .done
-.doUse:
-    call    TryExploit
-.done:
-    ret
+    jp      z, TryScan
+    jp      TryExploit
 
 ; ===========================================================================
 ;  UpdatePlayerPhysics — gravity, integrate, collide
@@ -1095,26 +1396,22 @@ UpdatePlayerPhysics:
     ; Gravity — add each frame; clamp only positive (downward) velocity to MAX_FALL
     ld      a, [wPVY]
     add     GRAVITY
-    ; Only clamp if result is positive (< 128) AND exceeds MAX_FALL
     cp      128
     jr      nc, .setVY      ; negative (upward) — no clamp needed
     cp      MAX_FALL + 1
-    jr      c, .setVY       ; positive but within limit
-    ld      a, MAX_FALL     ; cap downward speed
+    jr      c, .setVY
+    ld      a, MAX_FALL
 .setVY:
     ld      [wPVY], a
 
-    ; Integrate Y — clamp step to 8px max to prevent skipping through a tile
-    ld      a, [wPVY]
-    cp      128             ; negative (upward)?
+    ; Integrate Y — clamp step to 8px either way so tiles can't be skipped
+    cp      128
     jr      nc, .intYNeg
-    ; Positive (downward) — clamp to 8px max per frame
     cp      9
     jr      c, .intYStep
     ld      a, 8
     jr      .intYStep
 .intYNeg:
-    ; Negative (upward) — clamp magnitude: if < 248 (i.e. faster than -8), cap at 248
     cp      248
     jr      nc, .intYStep
     ld      a, 248
@@ -1122,77 +1419,112 @@ UpdatePlayerPhysics:
     ld      b, a
     ld      a, [wPY]
     add     b
-.doColY:
-    ; Clamp Y to screen bottom — just stop downward movement, tile collision sets OnGround
+    ; Clamp Y to screen bottom — tile collision sets OnGround
     cp      120
     jr      c, .yOK
     ld      a, 120
     ld      b, a
     xor     a
-    ld      [wPVY], a   ; zero downward velocity
-    ld      a, b        ; restore clamped Y
+    ld      [wPVY], a
+    ld      a, b
 .yOK:
-    ; Check ceiling — only clamp if NOT in the vertical passage gap (X 64-87)
+    ; Ceiling — only clamp if NOT in the vertical passage gap (X 64-87)
     cp      8
     jr      nc, .yFloor
-    ; wPY < 8 — check if in passage gap
     push    af
     ld      a, [wPX]
     cp      64
-    jr      c, .hardCeiling     ; left of gap — hard ceiling
+    jr      c, .hardCeiling
     cp      88
-    jr      nc, .hardCeiling    ; right of gap — hard ceiling
-    ; In passage gap — allow upward exit, don't clamp
+    jr      nc, .hardCeiling
     pop     af
     jr      .yFloor
 .hardCeiling:
     pop     af
     xor     a
-    ld      [wPVY], a           ; stop upward
+    ld      [wPVY], a
     ld      a, 8
 .yFloor:
-    ; Tile collision Y — check feet tile (Y+16, X+4)
     ld      [wPY], a
     call    CheckTileCollisionY
 
-    ; Integrate X
-    ld      a, [wPX]
-    ld      b, a
+    ; Integrate X: HL = sign-extended VX (1/16 px) + fraction
     ld      a, [wPVX]
+    ld      l, a
+    rla
+    sbc     a, a
+    ld      h, a
+    ld      a, [wPXSub]
+    ld      c, a
+    ld      b, 0
+    add     hl, bc
+    ld      a, l
+    and     $0F
+    ld      [wPXSub], a
+    sra     h
+    rr      l
+    sra     h
+    rr      l
+    sra     h
+    rr      l
+    sra     h
+    rr      l
+    ld      b, l            ; B = whole-pixel step (signed)
+    ld      a, [wPX]
     add     b
-    ; Clamp X 0-152
+    bit     7, b            ; (leaves carry intact)
+    jr      z, .movedRight
+    jr      c, .xPos        ; moved left without passing X=0
+    xor     a               ; would wrap past the left edge
+    jr      .stopX
+.movedRight:
     cp      153
-    jr      c, .xOK
+    jr      c, .xPos
+    ld      a, 152
+.stopX:
+    ld      b, a
     xor     a
     ld      [wPVX], a
-    ld      a, 152          ; cap at right edge, NOT 0
-    jr      .xPos
-.xOK:
-    or      a
-    jr      nz, .xPos
-    xor     a
-    ld      [wPVX], a
+    ld      [wPXSub], a
+    ld      a, b
 .xPos:
     ld      [wPX], a
     call    CheckTileCollisionX
     call    CheckZoneTransition
+
+    ; Coyote timer refills on the ground and drains in the air
+    ld      a, [wPOnGround]
+    or      a
+    jr      z, .inAir
+    ld      a, COYOTE_FRAMES
+    ld      [wCoyote], a
+    jr      .jumpBuf
+.inAir:
+    ld      hl, wCoyote
+    ld      a, [hl]
+    or      a
+    jr      z, .jumpBuf
+    dec     [hl]
+.jumpBuf:
+    ld      hl, wJumpBuf
+    ld      a, [hl]
+    or      a
+    ret     z
+    dec     [hl]
     ret
 
 ; ===========================================================================
 ;  CheckTileCollisionY
-;  Checks tile at player feet (wPY+16, wPX+4).
+;  Checks the tile under the player's feet (wPY+16, wPX+4).
 ;  If solid: snap player on top, zero VY, set OnGround.
 ; ===========================================================================
 CheckTileCollisionY:
-    ; Feet pixel = wPY + 16
     ld      a, [wPY]
     add     16
-    ; Tile row = Y / 8
     srl     a
     srl     a
     srl     a
     ld      d, a            ; D = tile row
-    ; Foot X mid = wPX + 4
     ld      a, [wPX]
     add     4
     srl     a
@@ -1200,89 +1532,65 @@ CheckTileCollisionY:
     srl     a
     ld      e, a            ; E = tile col
     call    GetTile
-    cp      T_VOID
+    call    IsSolid
     jr      z, .noFloor
-    cp      T_BG_DOT
-    jr      z, .noFloor
-    cp      T_BG_HLINE
-    jr      z, .noFloor
-    cp      T_BG_VLINE
-    jr      z, .noFloor
-    cp      T_VULN_A
-    jr      z, .noFloor
-    cp      T_VULN_B
-    jr      z, .noFloor
-    cp      T_VULN_SCAN
-    jr      z, .noFloor
-    cp      T_VULN_EXP
-    jr      z, .noFloor
-    cp      T_EXPLOIT
-    jr      z, .noFloor
-    ; Solid — snap
     ld      a, d
-    sla     a
-    sla     a
-    sla     a               ; row * 8 = top of that tile
+    add     a, a
+    add     a, a
+    add     a, a            ; row * 8 = top of that tile
     sub     16              ; player Y = tile_top - 16
     ld      [wPY], a
     xor     a
     ld      [wPVY], a
-    ld      a, 1
+    inc     a
     ld      [wPOnGround], a
     ret
 .noFloor:
-    ; Not on ground — if was on ground last frame, clear it
-    ; (simple: if VY > 0 we're falling, clear OnGround)
+    ; Falling (VY > 0) means we're airborne
     ld      a, [wPVY]
     or      a
-    jr      z, .keepGround
-    cp      128             ; negative velocity = going up = not on ground
-    jr      nc, .keepGround
-    ; positive and non-zero = falling
+    ret     z
+    cp      128
+    ret     nc
     xor     a
     ld      [wPOnGround], a
-.keepGround:
     ret
 
 ; ===========================================================================
 ;  CheckTileCollisionX
-;  Checks tile to the left/right of player depending on velocity direction.
-;  Simple: check tile at (wPX, wPY+8) and (wPX+8, wPY+8).
+;  Checks the tile beside the player's body (wPY+8) in the direction of
+;  travel and snaps against walls.
 ; ===========================================================================
 CheckTileCollisionX:
-    ld      a, [wPVX]
-    or      a
-    ret     z
-    cp      128
-    jr      nc, .checkLeft
-    ; Moving right — check right edge tile (wPX+8, wPY+8)
-    ld      a, [wPX]
-    add     8
-    srl     a
-    srl     a
-    srl     a
-    ld      e, a
     ld      a, [wPY]
     add     8
     srl     a
     srl     a
     srl     a
     ld      d, a
+    ld      a, [wPVX]
+    or      a
+    ret     z
+    cp      128
+    jr      nc, .checkLeft
+    ; Moving right — tile at wPX+8
+    ld      a, [wPX]
+    add     8
+    srl     a
+    srl     a
+    srl     a
+    ld      e, a
     call    GetTile
     call    IsSolid
     ret     z
-    ; Hit wall — snap and zero VX
     ld      a, e
-    sla     a
-    sla     a
-    sla     a
+    add     a, a
+    add     a, a
+    add     a, a
     sub     8
-    ld      [wPX], a
-    xor     a
-    ld      [wPVX], a
-    ret
+    jr      .snap
 .checkLeft:
-    ; Moving left — check left edge (wPX-1, wPY+8)
+    ; Moving left — tile at wPX-1
     ld      a, [wPX]
     or      a
     ret     z
@@ -1291,75 +1599,28 @@ CheckTileCollisionX:
     srl     a
     srl     a
     ld      e, a
-    ld      a, [wPY]
-    add     8
-    srl     a
-    srl     a
-    srl     a
-    ld      d, a
     call    GetTile
     call    IsSolid
     ret     z
-    ; Snap right of wall tile
     ld      a, e
     inc     a
-    sla     a
-    sla     a
-    sla     a
+    add     a, a
+    add     a, a
+    add     a, a
+.snap:
     ld      [wPX], a
     xor     a
     ld      [wPVX], a
-    ret
-
-; ===========================================================================
-;  GetTile — D=row E=col, returns tile ID in A
-; ===========================================================================
-GetTile:
-    ; address = $9800 + row*32 + col  — preserves D (row) and E (col)
-    ld      a, d
-    ld      h, 0
-    ld      l, a
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl          ; HL = row * 32
-    ld      a, e
-    ld      b, 0
-    ld      c, a
-    add     hl, bc          ; HL = row*32 + col
-    ld      bc, $9800
-    add     hl, bc          ; HL = $9800 + row*32 + col  (DE preserved)
-    ld      a, [hl]
-    ret
-
-; ===========================================================================
-;  IsSolid — A = tile ID.
-;  Callers: call IsSolid / ret z  → skip wall response if NOT solid
-;  Returns Z=1 (passable), NZ (solid, blocks player).
-;  Solid for X-collision: T_PLAT_MID $61, T_PLAT_L $62, T_PLAT_R $63, T_WALL $64
-; ===========================================================================
-IsSolid:
-    cp      T_PLAT_MID
-    jr      z, .solid
-    cp      T_PLAT_L
-    jr      z, .solid
-    cp      T_PLAT_R
-    jr      z, .solid
-    cp      T_WALL
-    jr      z, .solid
-    ; Not solid — set Z=1
-    cp      a               ; A==A, always sets Z=1
-    ret
-.solid:
-    ; Solid — set NZ
-    or      1               ; A |= 1, clears Z
+    ld      [wPXSub], a
     ret
 
 ; ===========================================================================
 ;  CheckZoneTransition — if player walks off edge, load adjacent zone
 ; ===========================================================================
 CheckZoneTransition:
+    ld      a, [wGameState]
+    cp      STATE_BOSS
+    ret     z               ; the boss arena is sealed
     ld      a, [wPX]
     ; Right edge (X >= 152)
     cp      152
@@ -1403,649 +1664,457 @@ CheckZoneTransition:
 .done:
     ret
 
-; Zone adjacency table: [right, left, down, up] zone indices, $FF=none
-; Zone 0: right=1, left=FF, down=2, up=FF
-; Zone 1: right=4, left=0,  down=3, up=FF
-; Zone 2: right=FF,left=FF, down=5, up=0
-; Zone 3: right=FF,left=FF, down=FF,up=1
-; Zone 4: right=FF,left=1,  down=FF,up=FF
-; Zone 5: right=FF,left=FF, down=FF,up=2
-ZoneAdjTable:
-    DB 1,$FF,2,$FF   ; zone 0
-    DB 4,0,3,$FF     ; zone 1
-    DB $FF,$FF,5,0   ; zone 2
-    DB $FF,$FF,$FF,1 ; zone 3
-    DB $FF,1,$FF,$FF ; zone 4
-    DB $FF,$FF,$FF,2 ; zone 5
-
-; GetAdjHL — loads per-level adj table into HL, offsets by wZone*4 + D
-; D = direction offset (0=right, 1=left, 2=down, 3=up)
-; Returns target zone in A; returns Z=1 if $FF
+; GetAdjHL — D = direction offset (0=right, 1=left, 2=down, 3=up)
+; Returns the adjacent zone in A ($FF = none) from the level's adjacency table.
 GetAdjHL:
-    ld      a, [wLvlAdjTableLo]
+    ld      a, [wLvlAdjTable]
     ld      l, a
-    ld      a, [wLvlAdjTableHi]
-    ld      h, a            ; HL = adj table base
+    ld      a, [wLvlAdjTable + 1]
+    ld      h, a
     ld      a, [wZone]
     add     a, a
     add     a, a            ; zone * 4
-    ld      b, 0
+    add     a, d
     ld      c, a
-    add     hl, bc
-    ld      a, d            ; direction offset
     ld      b, 0
-    ld      c, a
     add     hl, bc
     ld      a, [hl]
     ret
 
-TransitionRight:
-    ld      d, 0            ; right = offset 0
-    call    GetAdjHL
-    cp      $FF
-    ret     z               ; no zone to right
+; EnterZone — A = zone, B = spawn X, C = spawn Y
+EnterZone:
     ld      [wZone], a
-    ld      a, 20           ; spawn just inside left opening (col 2+)
+    ld      a, b
     ld      [wPX], a
-    ld      a, 72           ; spawn above floor
+    ld      a, c
     ld      [wPY], a
     xor     a
     ld      [wPVX], a
+    ld      [wPXSub], a
     ld      [wPVY], a
-    call    LoadZone
-    ret
+    jp      LoadZone
+
+TransitionRight:
+    ld      d, 0
+    call    GetAdjHL
+    cp      $FF
+    ret     z
+    ld      bc, (20 << 8) | 72  ; spawn just inside left opening
+    jr      EnterZone
 
 TransitionLeft:
-    ld      d, 1            ; left = offset 1
+    ld      d, 1
     call    GetAdjHL
     cp      $FF
     ret     z
-    ld      [wZone], a
-    ld      a, 132          ; spawn just inside right opening (col 16)
-    ld      [wPX], a
-    ld      a, 72
-    ld      [wPY], a
-    xor     a
-    ld      [wPVX], a
-    ld      [wPVY], a
-    call    LoadZone
-    ret
+    ld      bc, (132 << 8) | 72 ; spawn just inside right opening
+    jr      EnterZone
 
 TransitionDown:
-    ld      d, 2            ; down = offset 2
+    ld      d, 2
     call    GetAdjHL
     cp      $FF
     ret     z
-    ld      [wZone], a
-    ld      a, 16           ; spawn below top wall (row 2)
-    ld      [wPY], a
-    ld      a, 48           ; spawn left of gap (col 6 = X 48)
-    ld      [wPX], a
-    xor     a
-    ld      [wPVX], a
-    ld      [wPVY], a
-    call    LoadZone
-    ret
+    ld      bc, (48 << 8) | 16  ; spawn below top wall, left of gap
+    jr      EnterZone
 
 TransitionUp:
-    ld      d, 3            ; up = offset 3
+    ld      d, 3
     call    GetAdjHL
     cp      $FF
     ret     z
-    ld      [wZone], a
-    ld      a, 56           ; spawn above floor, row 7 = Y 56
-    ld      [wPY], a
-    ld      a, 48           ; spawn left of gap (col 6 = X 48)
-    ld      [wPX], a
-    xor     a
-    ld      [wPVY], a
-    ld      [wPVX], a
-    call    LoadZone
-    ret
+    ld      bc, (48 << 8) | 56  ; spawn above floor, left of gap
+    jr      EnterZone
 
 ; ===========================================================================
-;  TryScan — A button near a vuln node triggers scan
-;  Checks distance to each vuln in current zone
+;  SCANNING
+;  B (grounded, empty-handed) near an unscanned vuln node fires the scan
+;  beam in the facing direction. The beam is drawn over the BG one tile per
+;  frame, stops at the first solid tile, and is restored from wZoneMap when
+;  the scan ends. In the boss fight the beam damages PATCH.EXE on contact.
 ; ===========================================================================
-; TryScanVuln — generic check for one vuln
-; B=vuln index (0-2), C=bit mask (1/2/4)
-; Reads wVuln0Zone/Row/Col (or 1 or 2) from WRAM
-; Triggers BeginScan(B) if player in range and not yet scanned
-; Trashes A, HL
-TryScanVuln:
-    ; Check zone matches
-    ld      a, b
-    or      a
-    jr      nz, .tv_chk1
-    ld      a, [wVuln0Zone]
-    jr      .tv_gotzone
-.tv_chk1:
-    cp      1
-    jr      nz, .tv_chk2
-    ld      a, [wVuln1Zone]
-    jr      .tv_gotzone
-.tv_chk2:
-    ld      a, [wVuln2Zone]
-.tv_gotzone:
-    ld      d, a            ; D = vuln zone
-    ld      a, [wZone]
-    cp      d
-    ret     nz              ; not in this zone
-    ; Check if already scanned
-    ld      a, [wVulnScanned]
-    and     c
-    ret     nz              ; already scanned
-    ; Get vuln pixel X = col * 8
-    ld      a, b
-    or      a
-    jr      nz, .tv_gcol1
-    ld      a, [wVuln0Col]
-    jr      .tv_gotcol
-.tv_gcol1:
-    cp      1
-    jr      nz, .tv_gcol2
-    ld      a, [wVuln1Col]
-    jr      .tv_gotcol
-.tv_gcol2:
-    ld      a, [wVuln2Col]
-.tv_gotcol:
-    add     a, a
-    add     a, a
-    add     a, a            ; col * 8 = pixel X
-    ld      d, a            ; D = vuln pixel X
-    ld      a, [wPX]
-    sub     d
-    jr      nc, .tv_absok
-    cpl
-    inc     a
-.tv_absok:
-    cp      20
-    ret     nc              ; too far
-    ld      a, b
-    call    BeginScan
-    ret
+DEF SCAN_BOSS EQU $FF       ; wScanVulnIdx value for the boss-fight scan
 
 TryScan:
     ld      a, [wScanActive]
     or      a
-    ret     nz              ; scan already running
-    ; In boss fight, fire scan only if player is on the same row as the boss
+    ret     nz
     ld      a, [wGameState]
     cp      STATE_BOSS
-    jr      nz, .ts_normal
-    ; Check vertical proximity: abs(playerY - BOSS_Y) < 24
+    jr      nz, .vulns
+    ; Boss fight: only fire on (roughly) the boss's floor
     ld      a, [wPY]
     sub     BOSS_Y
-    jr      nc, .bs_vok
+    jr      nc, .vOK
     cpl
     inc     a
-.bs_vok:
+.vOK:
     cp      24
-    ret     nc              ; too far vertically — no scan
-    xor     a               ; vuln index 0 — reused as boss scan
-    call    BeginScan
-    ret
-.ts_normal:
-    ; Check vuln 0
-    ld      b, 0
-    ld      c, 1
-    call    TryScanVuln
-    ; Check vuln 1
-    ld      b, 1
-    ld      c, 2
-    call    TryScanVuln
-    ; Check vuln 2 only if level has 3 vulns
+    ret     nc
+    ld      a, SCAN_BOSS
+    jr      BeginScan
+.vulns:
+    ld      c, 0
+.loop:
     ld      a, [wNumVulns]
-    cp      3
-    ret     nz
-    ld      b, 2
-    ld      c, 4
-    call    TryScanVuln
-    ret
+    cp      c
+    ret     z
+    ld      a, c
+    call    VulnPtr
+    ld      a, [wZone]
+    cp      [hl]
+    jr      nz, .next
+    ld      a, c
+    call    IndexToMask
+    ld      b, a
+    ld      a, [wVulnScanned]
+    and     b
+    jr      nz, .next
+    inc     hl
+    inc     hl
+    ld      a, [hl]         ; col
+    call    DistToCol
+    cp      SCAN_REACH
+    jr      nc, .next
+    ld      a, c
+    jr      BeginScan
+.next:
+    inc     c
+    jr      .loop
 
-; BeginScan: A = vuln index
+; BeginScan — A = vuln index (or SCAN_BOSS)
 BeginScan:
     ld      [wScanVulnIdx], a
     ld      a, SCAN_FRAMES
     ld      [wScanTimer], a
     ld      a, 1
     ld      [wScanActive], a
-    ld      a, [wPX]
-    ld      [wScanX], a
     xor     a
-    ld      [wScanBeamLen], a
+    ld      [wBeamLen], a
+    ld      a, [wPFacing]
+    ld      [wScanDir], a
+    ; Beam runs along the player's body row, starting next to their centre
+    ld      a, [wPY]
+    add     8
+    srl     a
+    srl     a
+    srl     a
+    ld      [wScanRow], a
+    ld      d, a
+    ld      a, [wPX]
+    add     4
+    srl     a
+    srl     a
+    srl     a
+    ld      [wScanCol], a
+    ld      e, a
+    ; Measure how far the beam can go before something solid
+    ld      b, 0
+.measure:
+    call    StepBeamCol
+    jr      c, .measured
+    call    GetTile
+    call    IsSolid
+    jr      nz, .measured
+    inc     b
+    ld      a, b
+    cp      SCAN_TILES
+    jr      c, .measure
+.measured:
+    ld      a, b
+    ld      [wBeamMax], a
+    ret
+
+; StepBeamCol — move E one tile in the scan direction; carry if off the zone
+StepBeamCol:
+    ld      a, [wScanDir]
+    or      a
+    jr      nz, .left
+    inc     e
+    ld      a, e
+    cp      ZONE_COLS
+    ccf
+    ret
+.left:
+    ld      a, e
+    or      a
+    scf
+    ret     z
+    dec     e
+    and     a               ; clear carry (A is non-zero)
+    ret
+
+; BeamTilePos — A = beam tile index → D = row, E = col. Clobbers B.
+BeamTilePos:
+    inc     a
+    ld      b, a
+    ld      a, [wScanRow]
+    ld      d, a
+    ld      a, [wScanDir]
+    or      a
+    ld      a, [wScanCol]
+    jr      nz, .left
+    add     b
+    ld      e, a
+    ret
+.left:
+    sub     b
+    ld      e, a
     ret
 
 ; ===========================================================================
-;  UpdateScan — advance scan beam animation
+;  UpdateScan — advance the scan beam
 ; ===========================================================================
 UpdateScan:
     ld      a, [wScanActive]
     or      a
     ret     z
 
-    ld      a, [wScanTimer]
-    dec     a
-    ld      [wScanTimer], a
-    jr      nz, .advance
-
-    ; Scan complete — erase beam tiles before doing anything else
-    call    ClearScanBeam
-    xor     a
-    ld      [wScanActive], a
-    xor     a
-    ld      [wScanBeamLen], a
-
-    ; If boss fight, damage boss instead of normal vuln flow
-    ld      a, [wGameState]
-    cp      STATE_BOSS
-    jr      nz, .notBoss
-    call    BossTakeScanHit
-    ret
-.notBoss:
-
-    ; Mark vuln as scanned
+    ; Grow the beam by one tile per frame up to its measured length
+    ld      a, [wBeamMax]
+    ld      c, a
+    ld      a, [wBeamLen]
+    cp      c
+    jr      nc, .grown
+    ld      c, a
+    inc     a
+    ld      [wBeamLen], a
+    ld      a, c
+    call    BeamTilePos
+    call    GetTileAddr
+    ld      a, T_BEAM_FULL
+    call    QueueTile
+.grown:
     ld      a, [wScanVulnIdx]
+    cp      SCAN_BOSS
+    jr      nz, .tick
+    ; Boss fight: the beam has to actually touch PATCH.EXE
+    call    BeamHitsBoss
+    jr      nc, .tick
+    call    EndScan
+    jp      BossTakeScanHit
+.tick:
+    ld      hl, wScanTimer
+    dec     [hl]
+    ret     nz
+    call    EndScan
+    ld      a, [wScanVulnIdx]
+    cp      SCAN_BOSS
+    ret     z               ; boss scan missed
+
+    ; Vuln scanned: mark it, spawn its exploit, tell the player
+    call    IndexToMask
     ld      b, a
     ld      a, [wVulnScanned]
-    ; Set bit b
-    ld      c, 1
-    or      a               ; b=0?
-    ld      a, b
-    or      a
-    jr      z, .setbit
-    ld      a, b
-    cp      1
-    jr      z, .bit1
-    ld      c, 4            ; bit 2
-    jr      .setbit
-.bit1:
-    ld      c, 2
-.setbit:
-    ld      a, [wVulnScanned]
-    or      c
+    or      b
     ld      [wVulnScanned], a
-
-    ; Spawn exploit
+    ld      a, [wScanVulnIdx]
+    ld      b, T_VULN_SCAN
+    call    SetVulnTile
     ld      a, [wScanVulnIdx]
     call    SpawnExploit
+    jp      ShowScanDialog
 
-    ; Show dialog
-    call    ShowScanDialog
-    ret
-
-.advance:
-    ; Grow beam
-    ld      a, [wScanBeamLen]
-    inc     a
-    cp      11              ; max 10 tiles wide
-    jr      nc, .noGrow
-    ld      [wScanBeamLen], a
-.noGrow:
-    ; Write beam tiles to tilemap
-    call    DrawScanBeam
-    ret
-
-; DrawScanBeam — write T_BEAM_FULL tiles from player X rightward
-DrawScanBeam:
-    ld      a, [wPX]
-    srl     a
-    srl     a
-    srl     a               ; start tile col
-    ld      e, a
-    ld      a, [wPY]
-    add     8
-    srl     a
-    srl     a
-    srl     a               ; tile row
-    ld      d, a
-    ld      a, [wScanBeamLen]
-    ld      b, a
-    ; Compute VRAM address
-.loop:
-    push    bc
-    push    de
-    call    GetTileAddr     ; HL = VRAM addr for D=row, E=col
-    ld      [hl], T_BEAM_FULL
-    pop     de
-    pop     bc
-    inc     e
-    dec     b
-    jr      nz, .loop
-    ret
-
-; ClearScanBeam — overwrite beam tiles with T_VOID (same coords as DrawScanBeam)
-ClearScanBeam:
-    ld      a, [wPX]
-    srl     a
-    srl     a
-    srl     a               ; start tile col
-    ld      e, a
-    ld      a, [wPY]
-    add     8
-    srl     a
-    srl     a
-    srl     a               ; tile row
-    ld      d, a
-    ld      b, 10           ; max beam length (SCAN_RANGE/8)
-.clrloop:
-    push    bc
-    push    de
-    call    GetTileAddr
-    ld      [hl], T_VOID
-    pop     de
-    pop     bc
-    inc     e
-    dec     b
-    jr      nz, .clrloop
-    ret
-
-GetTileAddr:
-    ld      a, d
-    ld      h, 0
-    ld      l, a
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    add     hl, hl
-    ld      a, e
-    ld      b, 0
-    ld      c, a
-    add     hl, bc
-    ld      bc, $9800
-    add     hl, bc
-    ret
-
-; ===========================================================================
-;  SpawnExploit: A = vuln index, set bit in wExploitSpawned
-; ===========================================================================
-SpawnExploit:
+; EndScan — stop the scan and restore the tiles under the beam
+EndScan:
+    xor     a
+    ld      [wScanActive], a
+    ld      a, [wBeamLen]
     or      a
-    jr      z, .exp0
-    cp      1
-    jr      z, .exp1
-    ; exp 2
-    ld      a, [wExploitSpawned]
-    set     2, a
-    ld      [wExploitSpawned], a
-    ret
-.exp0:
-    ld      a, [wExploitSpawned]
-    set     0, a
-    ld      [wExploitSpawned], a
-    ret
-.exp1:
-    ld      a, [wExploitSpawned]
-    set     1, a
-    ld      [wExploitSpawned], a
-    ret
-
-; ===========================================================================
-;  ShowScanDialog — set STATE_DIALOG, write lines, re-enter
-; ===========================================================================
-ShowScanDialog:
-    ld      a, STATE_DIALOG
-    ld      [wGameState], a
-    call    LCDOff
-    call    ClearBG
-    ; Line 0: "> VULN DETECTED!"
-    ld      hl, $9800
-    ld      de, StrScanHit
-    call    PrintStr
-    ; Line 1: CVE name — index = level * maxVulns + vulnIdx
-    ; Use LvlVulnNameTable (DW array, 3 entries per level × 5 levels = 15 DW)
-    call    GetVulnStringPair   ; returns DE=name, HL=desc (uses wCurrentLevel+wScanVulnIdx)
-    push    hl
-    ld      hl, $9820
-    call    PrintStr
-    pop     de
-    ld      hl, $9840
-    call    PrintStr
-    ; Line 3: exploit tool name
-    call    GetExpString        ; returns DE=exploit name string
-    ld      hl, $9860
-    call    PrintStr
-    ld      hl, $9900
-    ld      de, StrDismiss
-    call    PrintStr
-    call    LCDOn
-    ret
-
-; GetVulnStringPair — returns DE=name ptr, HL=desc ptr
-; Uses wCurrentLevel * 3 + wScanVulnIdx as table index
-; Caller must preserve desc ptr across PrintStr (DE clobbered)
-GetVulnStringPair:
-    ld      a, [wCurrentLevel]
-    ; index = level * 3 + vulnIdx (max 3 vulns/level)
-    add     a, a            ; level * 2
-    ld      b, a
-    ld      a, [wCurrentLevel]
-    add     b               ; level * 3
-    ld      b, a
-    ld      a, [wScanVulnIdx]
-    add     b               ; level*3 + vulnIdx
-    ; Each entry is 4 bytes (2 DW: name, desc)
-    add     a, a            ; *2
-    add     a, a            ; *4
-    ld      hl, LvlVulnNameTable
-    ld      b, 0
+    ret     z
     ld      c, a
-    add     hl, bc
-    ld      a, [hl+]
-    ld      e, a
-    ld      a, [hl+]
-    ld      d, a            ; DE = name ptr
-    ; Now read desc ptr into BC temporarily, then move to HL
-    ld      a, [hl+]
-    ld      c, a            ; desc lo
+.restore:
+    dec     c
+    ld      a, c
+    call    BeamTilePos
+    push    bc
+    call    GetMapAddr
     ld      a, [hl]
-    ld      b, a            ; desc hi
-    ld      h, b
-    ld      l, c            ; HL = desc ptr
+    push    af
+    call    GetTileAddr
+    pop     af
+    pop     bc
+    call    QueueTile
+    ld      a, c
+    or      a
+    jr      nz, .restore
+    ld      [wBeamLen], a
     ret
 
-; GetExpString — returns DE = exploit name for current level+vulnIdx
-GetExpString:
-    ld      a, [wCurrentLevel]
-    add     a, a
-    ld      b, a
-    ld      a, [wCurrentLevel]
-    add     b
-    ld      b, a
-    ld      a, [wScanVulnIdx]
-    add     b
-    add     a, a            ; *2 (DW table)
-    ld      hl, LvlExpNameTable
-    ld      b, 0
+; BeamHitsBoss — carry if the drawn beam covers PATCH.EXE's tile
+BeamHitsBoss:
+    ld      a, [wBossHP]
+    or      a
+    ret     z
+    ld      a, [wScanRow]
+    cp      BOSS_Y / 8
+    jr      nz, .miss
+    ld      a, [wBeamLen]
+    or      a
+    jr      z, .miss
     ld      c, a
-    add     hl, bc
-    ld      a, [hl+]
-    ld      e, a
-    ld      a, [hl]
+    ld      a, [wBossX]
+    add     4
+    srl     a
+    srl     a
+    srl     a
+    ld      b, a            ; B = boss centre col
+    ld      a, [wScanCol]
     ld      d, a
+    ld      a, [wScanDir]
+    or      a
+    jr      nz, .left
+    ld      a, b
+    sub     d               ; tiles to the right of the start
+    jr      .inRange
+.left:
+    ld      a, d
+    sub     b               ; tiles to the left of the start
+.inRange:
+    ; hit if 1 <= distance <= beam length (negative wraps high → miss)
+    or      a
+    jr      z, .miss
+    dec     a
+    cp      c
+    ret
+.miss:
+    and     a
+    ret
+
+; SetVulnTile — A = vuln index, B = tile. Updates the node's BG tile if it
+; is in the current zone.
+SetVulnTile:
+    call    VulnPtr
+    ld      a, [wZone]
+    cp      [hl]
+    ret     nz
+    inc     hl
+    ld      a, [hl+]
+    ld      d, a
+    ld      e, [hl]
+    ld      a, b
+    jp      SetMapTile
+
+; SpawnExploit — A = vuln index. Marks the exploit as lying in the world and
+; draws it if it spawned in the current zone.
+SpawnExploit:
+    ld      c, a
+    call    IndexToMask
+    ld      b, a
+    ld      a, [wExploitSpawned]
+    or      b
+    ld      [wExploitSpawned], a
+    ld      a, c
+    call    ExpPtr
+    ld      a, [wZone]
+    cp      [hl]
+    ret     nz
+    inc     hl
+    ld      a, [hl+]
+    ld      d, a
+    ld      e, [hl]
+    ld      a, T_EXPLOIT
+    jp      SetMapTile
+
+; GetVulnStringPair — returns DE=name ptr, HL=desc ptr for wScanVulnIdx
+; Table index = wCurrentLevel * 3 + vuln index
+GetVulnStringPair:
+    ld      a, [wScanVulnIdx]
+    call    LevelVulnSlot
+    add     a, a
+    add     a, a            ; 4 bytes per entry (DW name, DW desc)
+    ld      hl, LvlVulnNameTable
+    ld      c, a
+    ld      b, 0
+    add     hl, bc
+    ld      a, [hl+]
+    ld      e, a
+    ld      a, [hl+]
+    ld      d, a
+    ld      a, [hl+]
+    ld      h, [hl]
+    ld      l, a
+    ret
+
+; GetExpString — A = vuln index → DE = exploit tool name
+GetExpString:
+    call    LevelVulnSlot
+    add     a, a            ; DW table
+    ld      hl, LvlExpNameTable
+    ld      c, a
+    ld      b, 0
+    add     hl, bc
+    ld      a, [hl+]
+    ld      e, a
+    ld      d, [hl]
+    ret
+
+; LevelVulnSlot — A = vuln index → A = wCurrentLevel * MAX_VULNS + index
+LevelVulnSlot:
+    ld      b, a
+    ld      a, [wCurrentLevel]
+    ld      c, a
+    add     a, a
+    add     a, c
+    add     a, b
     ret
 
 ; ===========================================================================
-;  TryExploit — B button at a scanned vuln with matching exploit held
+;  TryExploit — B at a scanned vuln node while holding its exploit
 ; ===========================================================================
 TryExploit:
     ld      a, [wExploitHeld]
     or      a
-    ret     z               ; not holding anything
-
-    ; Exploit IDs: 1=vuln0, 2=vuln1, 3=vuln2
-    ld      b, a            ; b = exploit held (1-3)
-    dec     b               ; b = vuln index (0-2)
-
-    ; Check in correct zone via WRAM vuln zone table
-    ld      a, b
-    or      a
-    jr      nz, .te_chk1
-    ld      a, [wVuln0Zone]
-    jr      .te_gotzone
-.te_chk1:
-    cp      1
-    jr      nz, .te_chk2
-    ld      a, [wVuln1Zone]
-    jr      .te_gotzone
-.te_chk2:
-    ld      a, [wVuln2Zone]
-.te_gotzone:
-    ld      d, a
+    ret     z
+    dec     a
+    ld      c, a            ; C = vuln index this exploit is for
+    call    VulnPtr
     ld      a, [wZone]
-    cp      d
-    ret     nz              ; wrong zone
-
-    ; Must be scanned first (bit mask = 1 << vuln_idx)
-    ld      a, b
-    or      a
-    jr      nz, .te_bit1
-    ld      c, 1
-    jr      .te_chkscanned
-.te_bit1:
-    cp      1
-    jr      nz, .te_bit2
-    ld      c, 2
-    jr      .te_chkscanned
-.te_bit2:
-    ld      c, 4
-.te_chkscanned:
+    cp      [hl]
+    ret     nz
+    ld      a, c
+    call    IndexToMask
+    ld      b, a            ; B = vuln bit
     ld      a, [wVulnScanned]
-    and     c
-    ret     z               ; not scanned
-
-    ; Proximity check: vuln pixel X = col * 8
-    ld      a, b
-    or      a
-    jr      nz, .te_px1
-    ld      a, [wVuln0Col]
-    jr      .te_gotpx
-.te_px1:
-    cp      1
-    jr      nz, .te_px2
-    ld      a, [wVuln1Col]
-    jr      .te_gotpx
-.te_px2:
-    ld      a, [wVuln2Col]
-.te_gotpx:
-    add     a, a
-    add     a, a
-    add     a, a            ; col * 8 = pixel X
-    ld      d, a
-    ld      a, [wPX]
-    sub     d
-    jr      nc, .te_absok
-    cpl
-    inc     a
-.te_absok:
-    cp      20
+    and     b
+    ret     z
+    inc     hl
+    inc     hl
+    ld      a, [hl]
+    call    DistToCol
+    cp      SCAN_REACH
     ret     nc
 
-    ; Mark exploited
-    ld      a, b
-    or      a
-    jr      nz, .te_set1
     ld      a, [wVulnExploited]
-    set     0, a
+    or      b
     ld      [wVulnExploited], a
-    jr      .te_afterset
-.te_set1:
-    cp      1
-    jr      nz, .te_set2
-    ld      a, [wVulnExploited]
-    set     1, a
-    ld      [wVulnExploited], a
-    jr      .te_afterset
-.te_set2:
-    ld      a, [wVulnExploited]
-    set     2, a
-    ld      [wVulnExploited], a
-.te_afterset:
-    ; Consume exploit
     xor     a
     ld      [wExploitHeld], a
+    push    bc
+    ld      a, c
+    ld      b, T_VULN_EXP
+    call    SetVulnTile
+    call    QueueHUDStats
+    pop     bc
 
-    ; Update vuln tile in map
-    ld      a, b
-    call    SetVulnExploitedTile
-
-    ; Check win condition: all numVulns bits set
+    ; Level complete once every vuln node is exploited
     ld      a, [wNumVulns]
-    cp      3
-    jr      z, .te_need3
-    ; 2 vulns: need bits 0 and 1 set
-    ld      a, [wVulnExploited]
-    and     %00000011
-    cp      %00000011
-    jr      z, .te_win
-    call    ShowExploitDialog
-    ret
-.te_need3:
-    ld      a, [wVulnExploited]
-    cp      %00000111
-    jr      z, .te_win
-    call    ShowExploitDialog
-    ret
-.te_win:
-    call    DrawWinScreen
-    ret
-
-SetVulnExploitedTile:
-    ; A = vuln index (0-2), write T_VULN_EXP to correct tile using WRAM row/col
+    call    IndexToMask
+    dec     a               ; (1 << numVulns) - 1
     ld      b, a
-    or      a
-    jr      nz, .svt1
-    ld      a, [wVuln0Row]
-    ld      d, a
-    ld      a, [wVuln0Col]
-    ld      e, a
-    jr      .svt_write
-.svt1:
-    cp      1
-    jr      nz, .svt2
-    ld      a, [wVuln1Row]
-    ld      d, a
-    ld      a, [wVuln1Col]
-    ld      e, a
-    jr      .svt_write
-.svt2:
-    ld      a, [wVuln2Row]
-    ld      d, a
-    ld      a, [wVuln2Col]
-    ld      e, a
-.svt_write:
-    call    GetTileAddr
-    ld      [hl], T_VULN_EXP
-    ret
-
-ShowExploitDialog:
-    ld      a, STATE_DIALOG
-    ld      [wGameState], a
-    call    LCDOff
-    call    ClearBG
-    ld      hl, $9820
-    ld      de, StrExploited
-    call    PrintStr
-    ; Show exploit used string from per-level table
-    call    GetExpString        ; DE = exploit name
-    ld      hl, $9840
-    call    PrintStr
-    ld      hl, $9900
-    ld      de, StrDismiss
-    call    PrintStr
-    call    LCDOn
-    ret
+    ld      a, [wVulnExploited]
+    cp      b
+    jp      z, DrawWinScreen
+    ld      a, c
+    jp      ShowExploitDialog
 
 ; ===========================================================================
-;  CheckPickup — auto-collect exploit if player overlaps its tile
+;  CheckPickup — auto-collect an exploit when the player's body touches it
 ; ===========================================================================
 CheckPickup:
     ld      a, [wExploitHeld]
     or      a
     ret     nz              ; already holding one
-
-    ; Compute player tile position
     ld      a, [wPX]
     add     4
     srl     a
@@ -2062,124 +2131,260 @@ CheckPickup:
     cp      T_EXPLOIT
     ret     nz
 
-    ; Which exploit is this? Cross-ref zone + position vs WRAM
-    ld      a, [wZone]
-    ld      b, a
-    ; Check exploit 0
-    ld      a, [wExp0Zone]
-    cp      b
-    jr      nz, .cp_chkE1
-    ld      a, [wExp0Row]
-    cp      d
-    jr      nz, .cp_chkE1
-    ld      a, [wExp0Col]
-    cp      e
-    jr      nz, .cp_chkE1
-    ld      a, 1
-    jr      .pickup
-.cp_chkE1:
-    ld      a, [wExp1Zone]
-    cp      b
-    jr      nz, .cp_chkE2
-    ld      a, [wExp1Row]
-    cp      d
-    jr      nz, .cp_chkE2
-    ld      a, [wExp1Col]
-    cp      e
-    jr      nz, .cp_chkE2
-    ld      a, 2
-    jr      .pickup
-.cp_chkE2:
-    ; Only check exploit2 if level has 3 vulns
+    ; Which exploit is this? Match zone + position
+    ld      c, 0
+.loop:
     ld      a, [wNumVulns]
-    cp      3
-    jr      nz, .noPickup
-    ld      a, [wExp2Zone]
-    cp      b
-    jr      nz, .noPickup
-    ld      a, [wExp2Row]
+    cp      c
+    ret     z
+    ld      a, c
+    call    IndexToMask
+    ld      b, a
+    ld      a, [wExploitSpawned]
+    and     b
+    jr      z, .next
+    ld      a, c
+    call    ExpPtr
+    ld      a, [wZone]
+    cp      [hl]
+    jr      nz, .next
+    inc     hl
+    ld      a, [hl+]
     cp      d
-    jr      nz, .noPickup
-    ld      a, [wExp2Col]
+    jr      nz, .next
+    ld      a, [hl]
     cp      e
-    jr      nz, .noPickup
-    ld      a, 3
-.pickup:
+    jr      z, .collect
+.next:
+    inc     c
+    jr      .loop
+.collect:
+    ; Clear the spawned bit so the pickup stays gone after the dialog
+    ld      a, b
+    cpl
+    ld      b, a
+    ld      a, [wExploitSpawned]
+    and     b
+    ld      [wExploitSpawned], a
+    ld      a, c
+    inc     a
     ld      [wExploitHeld], a
-    ; Clear the tile
-    push    de
-    call    GetTileAddr
-    ld      [hl], T_VOID
-    pop     de
-    ; Show pickup dialog
-    call    ShowPickupDialog
-    ret
-.noPickup:
-    ret
+    push    bc
+    ld      a, T_VOID
+    call    SetMapTile
+    call    QueueHUDStats
+    pop     bc
+    ld      a, c
+    jp      ShowPickupDialog
 
-ShowPickupDialog:
+; ===========================================================================
+;  DIALOG PANEL
+;  Dialogs are drawn into window rows 2-7 and revealed by lowering WY, so
+;  the zone stays on screen behind them. wDlgBuf is filled by DialogLine and
+;  streamed to VRAM one row per VBlank by StreamDialogRow.
+; ===========================================================================
+
+; DialogOpen — clear the panel buffer and enter STATE_DIALOG
+DialogOpen:
     ld      a, STATE_DIALOG
     ld      [wGameState], a
-    call    LCDOff
-    call    ClearBG
-    ld      hl, $9840
-    ld      de, StrPickedUp
-    call    PrintStr
-    ld      hl, $9900
-    ld      de, StrDismiss
-    call    PrintStr
-    call    LCDOn
+    ld      a, DLG_ROWS     ; nothing to stream until DialogShow
+    ld      [wDlgRow], a
+    ld      hl, wDlgBuf
+    ld      b, DLG_ROWS * ZONE_COLS
+    xor     a
+.clear:
+    ld      [hl+], a
+    dec     b
+    jr      nz, .clear
+    ; Hide sprites the panel will cover (OAM Y > WY_DIALOG + 8)
+    ld      hl, wOAMBuf
+    ld      b, 40
+.hide:
+    ld      a, [hl]
+    cp      WY_DIALOG + 9
+    jr      c, .keep
+    xor     a
+    ld      [hl], a
+.keep:
+    inc     l
+    inc     l
+    inc     l
+    inc     l
+    dec     b
+    jr      nz, .hide
     ret
 
-; ===========================================================================
-;  UpdateDialog — A dismisses, restores STATE_PLAY + zone
-; ===========================================================================
+; DialogLine — B = panel row (0-5), DE = string. Clobbers C, HL.
+DialogLine:
+    ld      a, b
+    add     a, a
+    add     a, a
+    ld      c, a
+    add     a, a
+    add     a, a
+    add     a, c            ; row * 20
+    ld      hl, wDlgBuf
+    add     a, l
+    ld      l, a
+    adc     a, h
+    sub     l
+    ld      h, a
+    ld      c, ZONE_COLS
+.copy:
+    ld      a, [de]
+    or      a
+    ret     z
+    sub     $20
+    ld      [hl+], a
+    inc     de
+    dec     c
+    jr      nz, .copy
+    ret
+
+; DialogShow — start streaming the panel to the window
+DialogShow:
+    xor     a
+    ld      [wDlgRow], a
+    ret
+
+; StreamDialogRow — VBlank only. Copies one panel row to window row 2+N;
+; after the last row, raises the panel.
+StreamDialogRow:
+    ld      a, [wDlgRow]
+    cp      DLG_ROWS
+    ret     nc
+    ld      b, a
+    inc     a
+    ld      [wDlgRow], a
+    ; DE = wDlgBuf + row * 20
+    ld      a, b
+    add     a, a
+    add     a, a
+    ld      c, a
+    add     a, a
+    add     a, a
+    add     a, c
+    ld      hl, wDlgBuf
+    add     a, l
+    ld      e, a
+    adc     a, h
+    sub     e
+    ld      d, a
+    ; HL = $9C00 + (row + 2) * 32
+    ld      a, b
+    add     2
+    swap    a               ; *16
+    add     a, a            ; *32 (row + 2 <= 7, fits in a byte)
+    ld      l, a
+    ld      h, $9C
+    ld      c, ZONE_COLS
+.copy:
+    ld      a, [de]
+    ld      [hl+], a
+    inc     de
+    dec     c
+    jr      nz, .copy
+    ld      a, b
+    cp      DLG_ROWS - 1
+    ret     nz
+    ld      a, WY_DIALOG
+    ld      [rWY], a
+    ret
+
+; UpdateDialog — A closes the panel once it is fully drawn
 UpdateDialog:
+    ld      a, [wDlgRow]
+    cp      DLG_ROWS
+    jp      c, MainLoop
     ld      a, [wJoypadNew]
-    bit     0, a            ; A dismisses dialog
+    bit     PADB_A, a
     jp      z, MainLoop
+    ld      a, WY_HUD
+    ld      [rWY], a
     ld      a, STATE_PLAY
     ld      [wGameState], a
-    call    LoadZone
     jp      MainLoop
 
+ShowScanDialog:
+    call    DialogOpen
+    ld      b, 0
+    ld      de, StrScanHit
+    call    DialogLine
+    call    GetVulnStringPair   ; DE = CVE id, HL = description
+    push    hl
+    ld      b, 1
+    call    DialogLine
+    pop     de
+    ld      b, 2
+    call    DialogLine
+    ld      a, [wScanVulnIdx]
+    call    GetExpString
+    ld      b, 3
+    call    DialogLine
+    ld      b, 5
+    ld      de, StrDismiss
+    call    DialogLine
+    jp      DialogShow
+
+; ShowPickupDialog — A = vuln index the exploit belongs to
+ShowPickupDialog:
+    push    af
+    call    DialogOpen
+    ld      b, 0
+    ld      de, StrPickedUp
+    call    DialogLine
+    pop     af
+    call    GetExpString
+    ld      b, 1
+    call    DialogLine
+    ld      b, 5
+    ld      de, StrDismiss
+    call    DialogLine
+    jp      DialogShow
+
+; ShowExploitDialog — A = vuln index that was exploited
+ShowExploitDialog:
+    push    af
+    call    DialogOpen
+    ld      b, 0
+    ld      de, StrExploited
+    call    DialogLine
+    pop     af
+    call    GetExpString
+    ld      b, 1
+    call    DialogLine
+    ld      b, 5
+    ld      de, StrDismiss
+    call    DialogLine
+    jp      DialogShow
+
 ; ===========================================================================
-;  DrawWinScreen — mark level complete, go to map (or final win if all done)
+;  DrawWinScreen — mark level complete, save, go to map (or boss if all done)
 ; ===========================================================================
 DrawWinScreen:
-    ; Set bit (1 << wCurrentLevel) in wLevelComplete
     ld      a, [wCurrentLevel]
-    ld      hl, LvlBitTable
-    ld      b, 0
-    ld      c, a
-    add     hl, bc
-    ld      a, [hl]         ; bit mask for this level
+    call    IndexToMask
     ld      b, a
     ld      a, [wLevelComplete]
     or      b
     ld      [wLevelComplete], a
-
-    ; Check if all 5 levels complete ($1F = bits 0-4 set) — go to boss
-    cp      $1F
+    call    WriteSave
+    ld      a, [wLevelComplete]
+    cp      ALL_LEVELS
     jp      z, DrawBossScreen
-
-    ; Not all done — go back to map
-    call    DrawMapScreen
-    ret
-
-; Bit mask table: LvlBitTable[N] = (1 << N)
-LvlBitTable:
-    DB $01, $02, $04, $08, $10
+    jp      DrawMapScreen
 
 ; DrawFinalWin — shown when boss is defeated
 DrawFinalWin:
     ld      a, STATE_WIN
     ld      [wGameState], a
-    ; Silence music on win screen
     ld      a, SONG_OFF
     call    MusicPlay
     call    LCDOff
     call    ClearBG
+    ld      a, WY_HIDDEN
+    ld      [rWY], a
     ld      hl, $9840
     ld      de, StrWin1
     call    PrintStr
@@ -2195,216 +2400,116 @@ DrawFinalWin:
     ld      hl, $9900
     ld      de, StrWin5
     call    PrintStr
+    ld      hl, $9980
+    ld      de, StrWinPrompt
+    call    PrintStr
     call    LCDOn
     ret
 
+; UpdateWin — Start returns to the title screen
+UpdateWin:
+    ld      a, [wJoypadNew]
+    bit     PADB_START, a
+    jp      z, MainLoop
+    ld      a, STATE_TITLE
+    ld      [wGameState], a
+    call    DrawTitleScreen
+    ld      a, SONG_TITLE
+    call    MusicPlay
+    jp      MainLoop
+
 ; ===========================================================================
 ;  InitLevel — A = level index (0-4)
-;  Loads level data from LevelTable into WRAM, resets progress, calls InitPlay
+;  Loads level data from LevelTable into WRAM, resets progress, loads the
+;  start zone and starts the gameplay music.
 ; ===========================================================================
 InitLevel:
     ld      [wCurrentLevel], a
-
-    ; Get pointer to LevelNData: LevelTable[A*2]
-    add     a, a            ; *2
+    add     a, a
     ld      hl, LevelTable
-    ld      b, 0
     ld      c, a
+    ld      b, 0
     add     hl, bc
     ld      a, [hl+]
-    ld      e, a
-    ld      a, [hl]
-    ld      d, a            ; DE = LevelNData ptr
+    ld      h, [hl]
+    ld      l, a            ; HL = LevelNData
 
-    ; Read numZones (byte 0)
-    ld      a, [de]
+    ld      a, [hl+]
     ld      [wNumZones], a
-    inc     de
-
-    ; Read numVulns (byte 1)
-    ld      a, [de]
+    ld      a, [hl+]
     ld      [wNumVulns], a
-    inc     de
+    ld      a, [hl+]
+    ld      [wLvlZoneTable], a
+    ld      a, [hl+]
+    ld      [wLvlZoneTable + 1], a
+    ld      a, [hl+]
+    ld      [wLvlAdjTable], a
+    ld      a, [hl+]
+    ld      [wLvlAdjTable + 1], a
 
-    ; Read ZoneTablePtr (word 2-3) lo-hi
-    ld      a, [de]
-    ld      [wLvlZoneTableLo], a
-    inc     de
-    ld      a, [de]
-    ld      [wLvlZoneTableHi], a
-    inc     de
+    ; Unused vuln/exploit slots stay zeroed
+    push    hl
+    ld      hl, wVulns
+    ld      bc, wVulnsEnd - wVulns
+    call    ZeroMem
+    pop     hl
+    ld      de, wVulns
+    call    CopyVulnTriples
+    ld      de, wExps
+    call    CopyVulnTriples
 
-    ; Read AdjTablePtr (word 4-5) lo-hi
-    ld      a, [de]
-    ld      [wLvlAdjTableLo], a
-    inc     de
-    ld      a, [de]
-    ld      [wLvlAdjTableHi], a
-    inc     de
-
-    ; Read vuln entries (3 bytes each × numVulns)
-    ld      a, [wNumVulns]
-    ld      b, a            ; B = num vulns to read
-
-    ; Vuln 0 always present
-    ld      a, [de]
-    ld      [wVuln0Zone], a
-    inc     de
-    ld      a, [de]
-    ld      [wVuln0Row], a
-    inc     de
-    ld      a, [de]
-    ld      [wVuln0Col], a
-    inc     de
-    dec     b
-    jr      z, .il_novuln12
-
-    ; Vuln 1
-    ld      a, [de]
-    ld      [wVuln1Zone], a
-    inc     de
-    ld      a, [de]
-    ld      [wVuln1Row], a
-    inc     de
-    ld      a, [de]
-    ld      [wVuln1Col], a
-    inc     de
-    dec     b
-    jr      z, .il_novuln2
-
-    ; Vuln 2 (only level 0)
-    ld      a, [de]
-    ld      [wVuln2Zone], a
-    inc     de
-    ld      a, [de]
-    ld      [wVuln2Row], a
-    inc     de
-    ld      a, [de]
-    ld      [wVuln2Col], a
-    inc     de
-    jr      .il_readexploits
-
-.il_novuln12:
-    ; Zero vuln1 and vuln2 positions (won't be used)
-    xor     a
-    ld      [wVuln1Zone], a
-    ld      [wVuln1Row], a
-    ld      [wVuln1Col], a
-    jr      .il_novuln2plus
-
-.il_novuln2:
-.il_novuln2plus:
-    xor     a
-    ld      [wVuln2Zone], a
-    ld      [wVuln2Row], a
-    ld      [wVuln2Col], a
-
-.il_readexploits:
-    ; Read exploit entries (numVulns exploits)
-    ld      a, [wNumVulns]
-    ld      b, a
-
-    ; Exploit 0 always present
-    ld      a, [de]
-    ld      [wExp0Zone], a
-    inc     de
-    ld      a, [de]
-    ld      [wExp0Row], a
-    inc     de
-    ld      a, [de]
-    ld      [wExp0Col], a
-    inc     de
-    dec     b
-    jr      z, .il_noexp12
-
-    ; Exploit 1
-    ld      a, [de]
-    ld      [wExp1Zone], a
-    inc     de
-    ld      a, [de]
-    ld      [wExp1Row], a
-    inc     de
-    ld      a, [de]
-    ld      [wExp1Col], a
-    inc     de
-    dec     b
-    jr      z, .il_noexp2
-
-    ; Exploit 2 (only level 0)
-    ld      a, [de]
-    ld      [wExp2Zone], a
-    inc     de
-    ld      a, [de]
-    ld      [wExp2Row], a
-    inc     de
-    ld      a, [de]
-    ld      [wExp2Col], a
-    inc     de
-    jr      .il_startpos
-
-.il_noexp12:
-    xor     a
-    ld      [wExp1Zone], a
-    ld      [wExp1Row], a
-    ld      [wExp1Col], a
-    jr      .il_noexp2done
-
-.il_noexp2:
-.il_noexp2done:
-    xor     a
-    ld      [wExp2Zone], a
-    ld      [wExp2Row], a
-    ld      [wExp2Col], a
-
-.il_startpos:
-    ; Read start position
-    ld      a, [de]
+    ld      a, [hl+]
     ld      [wLvlStartZone], a
-    inc     de
-    ld      a, [de]
+    ld      a, [hl+]
     ld      [wLvlStartX], a
-    inc     de
-    ld      a, [de]
+    ld      a, [hl]
     ld      [wLvlStartY], a
 
-    ; Now init gameplay state
+    ; Fresh gameplay state
     ld      a, STATE_PLAY
     ld      [wGameState], a
     ld      a, [wLvlStartX]
     ld      [wPX], a
     ld      a, [wLvlStartY]
     ld      [wPY], a
+    ld      a, [wLvlStartZone]
+    ld      [wZone], a
     xor     a
+    ld      [wPXSub], a
     ld      [wPVX], a
     ld      [wPVY], a
     ld      [wPFacing], a
     ld      [wPOnGround], a
-    ld      a, [wLvlStartZone]
-    ld      [wZone], a
-    xor     a
-    ld      [wCamX], a
-    ld      [wCamY], a
+    ld      [wCoyote], a
+    ld      [wJumpBuf], a
+    ld      [wInvuln], a
+    ld      [wPlayerDown], a
     ld      [wScanActive], a
-    ld      [wDialogActive], a
     ld      [wVulnScanned], a
     ld      [wVulnExploited], a
     ld      [wExploitSpawned], a
     ld      [wExploitHeld], a
-    ld      [wTimerLo], a
-    ld      [wTimerHi], a
-    ld      [wAdvCount], a      ; zero advisory count before InitAdvisories sets it
-    ld      [wAdvHit], a        ; clear advisory hit flag
-    ld      a, 5
+    ld      [wAdvCount], a
+    ld      a, MAX_HEALTH
     ld      [wHealth], a
     call    InitAdvisories
     call    LoadZone
-    ; Start gameplay music (skip if STATE_BOSS borrowed InitLevel)
-    ld      a, [wGameState]
-    cp      STATE_BOSS
-    jr      z, .il_nomusic
     ld      a, SONG_PLAY
-    call    MusicPlay
-.il_nomusic:
+    jp      MusicPlay
+
+; CopyVulnTriples — copy wNumVulns × 3 bytes from HL to DE (advances HL)
+CopyVulnTriples:
+    ld      a, [wNumVulns]
+    ld      b, a
+    add     a, a
+    add     a, b
+    ld      b, a
+.copy:
+    ld      a, [hl+]
+    ld      [de], a
+    inc     de
+    dec     b
+    jr      nz, .copy
     ret
 
 ; ===========================================================================
@@ -2547,70 +2652,49 @@ UpdateAdvisories:
     ret
 
 ; ---------------------------------------------------------------------------
-;  CheckAdvisoryCollision — if player overlaps any advisory in current zone
-;  sets wAdvHit = 1. DrawMapScreen called cleanly next frame.
-;  Player box: (wPX, wPY) 8×16.  Advisory box: (X, Y=64) 8×8.
+; ---------------------------------------------------------------------------
+;  CheckAdvisoryCollision — damage the player if they overlap an advisory in
+;  the current zone. Player box: (wPX, wPY) 8×16. Advisory box: (X, 64) 8×8.
 ; ---------------------------------------------------------------------------
 CheckAdvisoryCollision:
-    ld      a, [wSpawnGrace]    ; skip collision during spawn grace period
-    or      a
-    ret     nz
     ld      a, [wAdvCount]
     or      a
     ret     z
-    ld      a, [wAdvCount]
     ld      b, a
     ld      hl, wAdv0X
-.cac_loop:
-    push    bc
-    push    hl
-    ; Check zone match first (struct[+3])
+.loop:
+    ld      a, [hl+]        ; X
+    ld      c, a
     inc     hl
     inc     hl
-    inc     hl                  ; HL = Zone byte
-    ld      a, [hl]
+    ld      a, [hl+]        ; Zone (HL now at next struct)
     ld      d, a
     ld      a, [wZone]
     cp      d
-    jr      nz, .cac_noHit      ; different zone — skip
-    ; Back to X byte
-    pop     hl
-    push    hl
-    ld      a, [hl]             ; advisory X
-    ld      c, a
-    ; Horizontal overlap: abs(playerX - advX) < 8
+    jr      nz, .next
+    ; abs(playerX - advX) < 8
     ld      a, [wPX]
     sub     c
-    jr      nc, .cac_posH
+    jr      nc, .posH
     cpl
     inc     a
-.cac_posH:
+.posH:
     cp      8
-    jr      nc, .cac_noHit
-    ; Vertical overlap: advisory Y is always 64; abs(playerY - 64) < 16
+    jr      nc, .next
+    ; advisory Y is always 64; abs(playerY - 64) < 16
     ld      a, [wPY]
     sub     64
-    jr      nc, .cac_posV
+    jr      nc, .posV
     cpl
     inc     a
-.cac_posV:
+.posV:
     cp      16
-    jr      nc, .cac_noHit
-    ; Hit!
-    pop     hl
-    pop     bc
-    ld      a, 1
-    ld      [wAdvHit], a
-    ret
-.cac_noHit:
-    pop     hl
-    inc     hl
-    inc     hl
-    inc     hl
-    inc     hl                  ; next struct (4 bytes)
-    pop     bc
+    jr      nc, .next
+    ld      b, c
+    jp      DamagePlayer
+.next:
     dec     b
-    jr      nz, .cac_loop
+    jr      nz, .loop
     ret
 
 ; ---------------------------------------------------------------------------
@@ -2686,20 +2770,32 @@ UpdateAdvisorySprites:
     jr      nz, .uas_loop
     ret
 
+
 ; ===========================================================================
 ;  DrawPatchedScreen / UpdatePatchedScreen
-;  Shown when an advisory hits the player. A button returns to world map.
+;  Shown when the player runs out of HP. A returns to the world map.
 ; ===========================================================================
 DrawPatchedScreen:
+    ld      a, [wGameState]
+    cp      STATE_BOSS
+    ld      de, StrPatched2
+    jr      nz, .gotCause
+    ld      de, StrPatched2Boss
+.gotCause:
+    push    de
     ld      a, STATE_PATCHED
     ld      [wGameState], a
+    xor     a
+    ld      [wPlayerDown], a
     call    LCDOff
     call    ClearBG
+    ld      a, WY_HIDDEN
+    ld      [rWY], a
     ld      hl, $9840
     ld      de, StrPatched1
     call    PrintStr
+    pop     de
     ld      hl, $9880
-    ld      de, StrPatched2
     call    PrintStr
     ld      hl, $98A0
     ld      de, StrPatched3
@@ -2712,140 +2808,122 @@ DrawPatchedScreen:
 
 UpdatePatchedScreen:
     ld      a, [wJoypadNew]
-    bit     0, a                ; A button
+    bit     PADB_A, a
     jp      z, MainLoop
     call    DrawMapScreen
+    ld      a, SONG_TITLE
+    call    MusicPlay
     jp      MainLoop
 
 ; ===========================================================================
 ;  Boss fight — PATCH
+;  PATCH.EXE charges back and forth along the floor. Touching it costs HP;
+;  three beam hits destroy it.
 ; ===========================================================================
 
 ; Boss Y is fixed at 80 (floor) — no WRAM field needed
 DEF BOSS_Y EQU 80
 
 DrawBossScreen:
-    ld      a, STATE_BOSS
-    ld      [wGameState], a
-    ld      a, 120
-    ld      [wBossX], a
-    ld      a, 255
-    ld      [wBossVX], a
-    ld      a, BOSS_MAX_HP
-    ld      [wBossHP], a
-    xor     a
-    ld      [wBossHitTimer], a
-    ld      a, 16
-    ld      [wPX], a
-    ld      a, 72
-    ld      [wPY], a
-    xor     a
-    ld      [wPVX], a
-    ld      [wPVY], a
-    ld      [wPFacing], a
-    ld      [wPOnGround], a
-    ld      [wScanActive], a
-    ld      [wZone], a
-    ; Set up level state so LoadZone can work — borrow level 4's zone table
+    ; Borrow level 5's first zone as the arena
     ld      a, [wCurrentLevel]
     push    af
-    ld      a, 4
-    call    InitLevel       ; sets zone tables, loads zone 0 tilemap, turns LCD on
+    ld      a, NUM_LEVELS - 1
+    call    InitLevel
     pop     af
     ld      [wCurrentLevel], a
-    ; Re-stamp game state and boss vars (InitLevel overwrites them)
     ld      a, STATE_BOSS
     ld      [wGameState], a
+    xor     a
+    ld      [wAdvCount], a      ; no advisories during boss fight
+    ld      [wBossHitTimer], a
+    ld      [wKonamiStep], a
     ld      a, 120
     ld      [wBossX], a
     ld      a, 255
     ld      [wBossVX], a
     ld      a, BOSS_MAX_HP
     ld      [wBossHP], a
-    xor     a
-    ld      [wBossHitTimer], a
-    ld      [wAdvCount], a      ; no advisories during boss fight
     ld      a, 16
     ld      [wPX], a
     ld      a, 72
     ld      [wPY], a
-    xor     a
-    ld      [wPVX], a
-    ld      [wPVY], a
-    ld      [wPFacing], a
-    ld      [wPOnGround], a
-    ld      [wScanActive], a
-    ; Overwrite row 0 of tilemap with boss title string
+    ; Boss title over the top wall row
     call    LCDOff
     ld      hl, $9800
     ld      de, StrBossTitle
     call    PrintStr
     call    LCDOnPlay
-    ; Start boss music
     ld      a, SONG_BOSS
-    call    MusicPlay
-    ret
+    jp      MusicPlay
 
 UpdateBossScreen:
+    ld      a, [wPlayerDown]
+    or      a
+    jr      z, .alive
+    call    DrawPatchedScreen
+    jp      MainLoop
+.alive:
+    call    TickPlayerTimers
     call    UpdatePlayerInput
     call    UpdatePlayerPhysics
-    call    UpdateScan
-    ; Hit timer tick
-    ld      a, [wBossHitTimer]
+    call    UpdateScan          ; may defeat the boss
+    JP_UNLESS_STATE STATE_BOSS
+    ld      hl, wBossHitTimer
+    ld      a, [hl]
     or      a
     jr      z, .move
-    dec     a
-    ld      [wBossHitTimer], a
+    dec     [hl]
 .move:
-    ; Move boss X
     ld      a, [wBossX]
     ld      b, a
     ld      a, [wBossVX]
     add     b
     cp      137
-    jr      nc, .bR
+    jr      nc, .bounceR
     cp      8
-    jr      nc, .bSet
+    jr      nc, .setX
     ld      a, 1
     ld      [wBossVX], a
     ld      a, 8
-    jr      .bSet
-.bR:
+    jr      .setX
+.bounceR:
     ld      a, 255
     ld      [wBossVX], a
     ld      a, 136
-.bSet:
+.setX:
     ld      [wBossX], a
-    ; Skip collision entirely if boss is already dead
+    ; Contact: abs(playerX - bossX) < 6 AND abs(playerY - BOSS_Y) < 10
     ld      a, [wBossHP]
     or      a
-    jr      z, .ok
-    ; Collision: abs(playerX - bossX) < 6 AND abs(playerY - BOSS_Y) < 10
+    jr      z, .draw
+    ld      a, [wBossX]
     ld      b, a
     ld      a, [wPX]
     sub     b
-    jr      nc, .pH
+    jr      nc, .absH
     cpl
     inc     a
-.pH:
+.absH:
     cp      6
-    jr      nc, .ok
+    jr      nc, .draw
     ld      a, [wPY]
     sub     BOSS_Y
-    jr      nc, .pV
+    jr      nc, .absV
     cpl
     inc     a
-.pV:
+.absV:
     cp      10
-    jr      nc, .ok
-    call    DrawPatchedScreen
-    jp      MainLoop
-.ok:
+    jr      nc, .draw
+    call    DamagePlayer        ; B = boss X
+.draw:
     call    UpdateOAM
-    ; Draw boss head sprite (single tile, no body, no flash)
     ld      a, [wBossHP]
     or      a
-    jr      z, .done
+    jp      z, MainLoop
+    ld      a, [wBossHitTimer]
+    and     %00000010           ; flash after a hit
+    jp      nz, MainLoop
     ld      hl, wOAMBuf + (OAM_BOSS_HEAD * 4)
     ld      a, BOSS_Y + 16
     ld      [hl+], a
@@ -2854,25 +2932,19 @@ UpdateBossScreen:
     ld      [hl+], a
     ld      a, SPR_BOSS_HEAD
     ld      [hl+], a
-    ld      a, $01
-    ld      [hl], a
-.done:
+    ld      [hl], $01
     jp      MainLoop
 
-; BossTakeScanHit — always hit when scan fires in STATE_BOSS
+; BossTakeScanHit — one beam hit on PATCH.EXE
 BossTakeScanHit:
     ld      a, [wBossHP]
     or      a
-    ret     z               ; already dead
+    ret     z
     dec     a
-    ld      [wBossHP], a    ; save new HP
-    push    af              ; save HP for zero-check after setting hit timer
-    ld      a, 16
+    ld      [wBossHP], a
+    jp      z, DrawFinalWin
+    ld      a, 24
     ld      [wBossHitTimer], a
-    pop     af              ; restore new HP value
-    or      a
-    ret     nz              ; HP > 0 — just a hit, not dead yet
-    call    DrawFinalWin
     ret
 
 ; ===========================================================================
@@ -2884,6 +2956,10 @@ DrawMapScreen:
     ld      [wGameState], a
     call    LCDOff
     call    ClearBG
+    ld      a, WY_HIDDEN
+    ld      [rWY], a
+    xor     a
+    ld      [wKonamiStep], a
 
     ; Draw horizontal trace: row 4, cols 4-15 (connects nodes 0 and 1)
     ld      b, 12           ; 12 tiles cols 4..15
@@ -2977,10 +3053,7 @@ DrawMapScreen:
     ld      e, a            ; col
     ; Determine tile: complete or not
     ld      a, c
-    ld      hl, LvlBitTable
-    ld      b, 0
-    add     hl, bc          ; HL = &LvlBitTable[c]
-    ld      a, [hl]         ; bit mask
+    call    IndexToMask
     ld      b, a
     ld      a, [wLevelComplete]
     and     b
@@ -3008,7 +3081,7 @@ DrawMapScreen:
     ld      hl, $9800
     ld      de, StrMapTitle
     call    PrintStr
-    ld      hl, $9BE0
+    ld      hl, $9A20       ; row 17 (last visible row)
     ld      de, StrMapPrompt
     call    PrintStr
 
@@ -3052,25 +3125,41 @@ DrawMapScreen:
     dec     b
     jr      nz, .dm_labels
 
+    ; Every level cleared: offer the boss fight
+    ld      a, [wLevelComplete]
+    cp      ALL_LEVELS
+    jr      nz, .dm_done
+    ld      hl, $9A00
+    ld      de, StrMapBoss
+    call    PrintStr
+.dm_done:
     call    LCDOn
     ret
 
-; DrawMapCursor — place cursor (T_WALL) above current map cursor node
-DrawMapCursor:
+; MapCursorAddr — HL = VRAM address one row above the current map node
+MapCursorAddr:
     ld      a, [wMapCursor]
-    add     a, a            ; *2
+    add     a, a
     ld      hl, MapNodePositions
-    ld      b, 0
     ld      c, a
+    ld      b, 0
     add     hl, bc
-    ld      a, [hl+]        ; row
+    ld      a, [hl+]
+    dec     a
     ld      d, a
-    dec     d               ; one row above node
-    ld      a, [hl]         ; col
-    ld      e, a
-    call    GetTileAddr
-    ld      [hl], T_WALL
-    ret
+    ld      e, [hl]
+    jp      GetTileAddr
+
+; DrawMapCursor / EraseMapCursor — work with the LCD on or off
+DrawMapCursor:
+    call    MapCursorAddr
+    ld      a, T_WALL
+    jp      QueueTile
+
+EraseMapCursor:
+    call    MapCursorAddr
+    ld      a, T_SPACE
+    jp      QueueTile
 
 ; MapNodePositions — 5 nodes: DB row, col
 MapNodePositions:
@@ -3097,40 +3186,43 @@ KonamiSequence:
     DB %00000010  ; B
     DB %00000001  ; A
 
-; CheckKonami — call each frame on map screen; if sequence complete, goes to boss
+; CheckKonami — call each frame on the map screen. Returns carry when the
+; sequence has just been completed.
 CheckKonami:
     ld      a, [wJoypadNew]
     or      a
-    ret     z               ; no new press this frame — no change to sequence
-    ; Look up expected button for current step
+    ret     z               ; no new press (carry clear)
+    ld      b, a
     ld      hl, KonamiSequence
-    ld      b, 0
     ld      a, [wKonamiStep]
-    ld      c, a
-    add     hl, bc          ; HL = &KonamiSequence[step]
-    ld      b, [hl]         ; B = expected button mask
-    ; Check if the new press matches
-    ld      a, [wJoypadNew]
-    and     b               ; isolate expected bits in what was pressed
-    cp      b               ; did we get exactly that button?
-    jr      nz, .kc_reset
-    ; Correct button — advance step
-    ld      a, [wKonamiStep]
+    ld      e, a
+    ld      d, 0
+    add     hl, de
+    ld      a, b
+    cp      [hl]            ; exactly the expected button?
+    jr      nz, .reset
+    ld      a, e
     inc     a
     ld      [wKonamiStep], a
-    cp      10              ; all 10 steps done?
-    ret     nz              ; not yet
-    ; Konami complete — skip straight to boss
+    cp      10
+    jr      z, .complete
+    and     a
+    ret
+.complete:
     xor     a
     ld      [wKonamiStep], a
-    ; Mark all levels complete so boss triggers correctly
-    ld      a, $1F
-    ld      [wLevelComplete], a
-    call    DrawBossScreen
-    jp      MainLoop
-.kc_reset:
-    xor     a
+    scf
+    ret
+.reset:
+    ; A wrong press may still be the first step of a new attempt
+    ld      a, [KonamiSequence]
+    cp      b
+    ld      a, 0
+    jr      nz, .store
+    inc     a
+.store:
     ld      [wKonamiStep], a
+    and     a
     ret
 
 ; ===========================================================================
@@ -3138,46 +3230,49 @@ CheckKonami:
 ; ===========================================================================
 UpdateMapScreen:
     call    CheckKonami
+    jr      nc, .noCheat
+    call    DrawBossScreen
+    jp      MainLoop
+.noCheat:
     ld      a, [wJoypadNew]
-    ; Left = move cursor left (decrement, wrap)
-    bit     5, a
-    jr      z, .ums_noLeft
+    bit     PADB_START, a
+    jr      z, .noStart
+    ; All five levels cleared: Start faces PATCH.EXE
+    ld      a, [wLevelComplete]
+    cp      ALL_LEVELS
+    jp      nz, MainLoop
+    call    DrawBossScreen
+    jp      MainLoop
+.noStart:
+    bit     PADB_LEFT, a
+    jr      z, .noLeft
+    call    EraseMapCursor
     ld      a, [wMapCursor]
     or      a
-    jr      z, .ums_wrapLeft
+    jr      nz, .decCursor
+    ld      a, NUM_LEVELS
+.decCursor:
     dec     a
-    ld      [wMapCursor], a
-    jr      .ums_moved
-.ums_wrapLeft:
-    ld      a, 4
-    ld      [wMapCursor], a
-    jr      .ums_moved
-.ums_noLeft:
-    ; Right = move cursor right (increment, wrap)
-    bit     4, a
-    jr      z, .ums_noRight
+    jr      .moved
+.noLeft:
+    bit     PADB_RIGHT, a
+    jr      z, .noRight
+    call    EraseMapCursor
     ld      a, [wMapCursor]
     inc     a
-    cp      5
-    jr      c, .ums_setRight
+    cp      NUM_LEVELS
+    jr      c, .moved
     xor     a
-.ums_setRight:
+.moved:
     ld      [wMapCursor], a
-.ums_moved:
-    ; Redraw map when cursor moves
-    call    DrawMapScreen
+    call    DrawMapCursor
     jp      MainLoop
-.ums_noRight:
-    ; A button = enter selected level
-    ld      a, [wJoypadNew]
-    bit     0, a
+.noRight:
+    bit     PADB_A, a
     jp      z, MainLoop
-    ; Enter level = wMapCursor
     ld      a, [wMapCursor]
     call    InitLevel
     jp      MainLoop
-
-
 
 ; ===========================================================================
 ;  UpdateOAM — build OAM shadow buffer for player + sprites
@@ -3270,6 +3365,18 @@ UpdateOAM:
 .bodyFlags:
     ld      [hl+], a
 
+    ; Blink while invulnerable after a hit
+    ld      a, [wInvuln]
+    or      a
+    jr      z, .visible
+    ld      a, [wFrame]
+    and     %00000100
+    jr      z, .visible
+    xor     a
+    ld      [wOAMBuf + OAM_PLAYER_HEAD * 4], a
+    ld      [wOAMBuf + OAM_PLAYER_BODY * 4], a
+.visible:
+
     ; Vuln node sprites (pulse animation)
     call    UpdateVulnSprites
 
@@ -3280,179 +3387,96 @@ UpdateOAM:
     call    UpdateAdvisorySprites
     ret
 
-; UpdateVulnSprites — place OAM entries for any vuln in current zone
+
+; UpdateVulnSprites — pulsing sprite on each unexploited vuln node in this zone
 UpdateVulnSprites:
+    ld      c, 0
+.loop:
+    ld      a, [wNumVulns]
+    cp      c
+    ret     z
+    ld      a, c
+    call    IndexToMask
+    ld      b, a
+    ld      a, [wVulnExploited]
+    and     b
+    jr      nz, .next
+    ld      a, c
+    call    VulnPtr
+    ld      a, [wZone]
+    cp      [hl]
+    jr      nz, .next
+    inc     hl
+    ld      a, [hl+]
+    ld      d, a            ; row
+    ld      e, [hl]         ; col
+    ld      b, SPR_VULN_A
     ld      a, [wFrame]
     and     %00001000
-    jr      z, .frameA
+    jr      z, .gotTile
     ld      b, SPR_VULN_B
-    jr      .drawVulns
-.frameA:
-    ld      b, SPR_VULN_A
-.drawVulns:
-    ; Draw vuln 0 sprite if in correct zone and not yet exploited
-    ld      a, [wVuln0Zone]
-    ld      e, a
-    ld      a, [wZone]
-    cp      e
-    jr      nz, .uvs_skipV0
-    ld      a, [wVulnExploited]
-    bit     0, a
-    jr      nz, .uvs_skipV0
-    ; pixel Y = wVuln0Row * 8 + 16 (OAM offset)
-    ld      a, [wVuln0Row]
-    add     a, a
-    add     a, a
-    add     a, a            ; row * 8
-    add     16
-    ld      hl, wOAMBuf + (OAM_VULN0 * 4)
-    ld      [hl+], a
-    ld      a, [wVuln0Col]
-    add     a, a
-    add     a, a
-    add     a, a            ; col * 8
-    add     8
-    ld      [hl+], a
-    ld      a, b            ; SPR_VULN_A or SPR_VULN_B
-    ld      [hl+], a
-    ld      a, $01
-    ld      [hl+], a
-.uvs_skipV0:
-    ld      a, [wVuln1Zone]
-    ld      e, a
-    ld      a, [wZone]
-    cp      e
-    jr      nz, .uvs_skipV1
-    ld      a, [wVulnExploited]
-    bit     1, a
-    jr      nz, .uvs_skipV1
-    ld      a, [wVuln1Row]
-    add     a, a
-    add     a, a
-    add     a, a
-    add     16
-    ld      hl, wOAMBuf + (OAM_VULN1 * 4)
-    ld      [hl+], a
-    ld      a, [wVuln1Col]
-    add     a, a
-    add     a, a
-    add     a, a
-    add     8
-    ld      [hl+], a
-    ld      a, b
-    ld      [hl+], a
-    ld      a, $01
-    ld      [hl+], a
-.uvs_skipV1:
-    ; Only draw vuln2 if level has 3 vulns
-    ld      a, [wNumVulns]
-    cp      3
-    ret     nz
-    ld      a, [wVuln2Zone]
-    ld      e, a
-    ld      a, [wZone]
-    cp      e
-    ret     nz
-    ld      a, [wVulnExploited]
-    bit     2, a
-    ret     nz
-    ld      a, [wVuln2Row]
-    add     a, a
-    add     a, a
-    add     a, a
-    add     16
-    ld      hl, wOAMBuf + (OAM_VULN2 * 4)
-    ld      [hl+], a
-    ld      a, [wVuln2Col]
-    add     a, a
-    add     a, a
-    add     a, a
-    add     8
-    ld      [hl+], a
-    ld      a, b
-    ld      [hl+], a
-    ld      a, $01
-    ld      [hl+], a
-    ret
+.gotTile:
+    ld      a, c
+    add     OAM_VULN0
+    call    PutTileSprite
+    ld      [hl], $01       ; OBJ palette 1
+.next:
+    inc     c
+    jr      .loop
 
-; UpdateExploitSprites — place OAM for any exploit pickup in current zone
+; UpdateExploitSprites — sprite on each spawned exploit pickup in this zone
 UpdateExploitSprites:
-    ld      a, [wExploitSpawned]
-    ld      b, a            ; save spawned bitmask
-
-    bit     0, b
-    jr      z, .ues_skipE0
-    ld      a, [wExp0Zone]
-    ld      e, a
-    ld      a, [wZone]
-    cp      e
-    jr      nz, .ues_skipE0
-    ld      hl, wOAMBuf + (OAM_EXP0 * 4)
-    ld      a, [wExp0Row]
-    add     a, a
-    add     a, a
-    add     a, a
-    add     16
-    ld      [hl+], a
-    ld      a, [wExp0Col]
-    add     a, a
-    add     a, a
-    add     a, a
-    add     8
-    ld      [hl+], a
-    ld      a, SPR_EXP_PICK
-    ld      [hl+], a
-    ld      a, $02
-    ld      [hl+], a
-.ues_skipE0:
-    bit     1, b
-    jr      z, .ues_skipE1
-    ld      a, [wExp1Zone]
-    ld      e, a
-    ld      a, [wZone]
-    cp      e
-    jr      nz, .ues_skipE1
-    ld      hl, wOAMBuf + (OAM_EXP1 * 4)
-    ld      a, [wExp1Row]
-    add     a, a
-    add     a, a
-    add     a, a
-    add     16
-    ld      [hl+], a
-    ld      a, [wExp1Col]
-    add     a, a
-    add     a, a
-    add     a, a
-    add     8
-    ld      [hl+], a
-    ld      a, SPR_EXP_SCR
-    ld      [hl+], a
-    ld      a, $02
-    ld      [hl+], a
-.ues_skipE1:
-    bit     2, b
+    ld      c, 0
+.loop:
+    ld      a, [wNumVulns]
+    cp      c
     ret     z
-    ld      a, [wExp2Zone]
-    ld      e, a
+    ld      a, c
+    call    IndexToMask
+    ld      b, a
+    ld      a, [wExploitSpawned]
+    and     b
+    jr      z, .next
+    ld      a, c
+    call    ExpPtr
     ld      a, [wZone]
-    cp      e
-    ret     nz
-    ld      hl, wOAMBuf + (OAM_EXP2 * 4)
-    ld      a, [wExp2Row]
+    cp      [hl]
+    jr      nz, .next
+    inc     hl
+    ld      a, [hl+]
+    ld      d, a
+    ld      e, [hl]
+    ld      a, c
+    add     SPR_EXP_PICK    ; one icon per exploit slot
+    ld      b, a
+    ld      a, c
+    add     OAM_EXP0
+    call    PutTileSprite
+    ld      [hl], $02       ; OBJ palette 2
+.next:
+    inc     c
+    jr      .loop
+
+; PutTileSprite — A = OAM slot, B = tile, D = tile row, E = tile col.
+; Writes Y, X, tile; returns HL at the attribute byte. Preserves C.
+PutTileSprite:
+    add     a, a
+    add     a, a
+    ld      l, a
+    ld      h, HIGH(wOAMBuf)
+    ld      a, d
     add     a, a
     add     a, a
     add     a, a
     add     16
     ld      [hl+], a
-    ld      a, [wExp2Col]
+    ld      a, e
     add     a, a
     add     a, a
     add     a, a
     add     8
     ld      [hl+], a
-    ld      a, SPR_EXP_TERM
-    ld      [hl+], a
-    ld      a, $02
+    ld      a, b
     ld      [hl+], a
     ret
 
@@ -3521,15 +3545,7 @@ PrintStrDirect:
 ClearBG:
     ld      hl, $9800
     ld      bc, $0400
-    xor     a
-.loop:
-    ld      [hl+], a
-    dec     bc
-    ld      a, b
-    or      c
-    ld      a, 0
-    jr      nz, .loop
-    ret
+    jp      ZeroMem
 
 ; ===========================================================================
 ;  SetupPalettes — GBC only, skipped on DMG
@@ -3592,12 +3608,12 @@ SetupPalettes:
 ; ---------------------------------------------------------------------------
 SwitchToBank2:
     ld      a, 2
-    ld      [$2000], a
+    ld      [rROMB], a
     ret
 
 SwitchToBank1:
     ld      a, 1
-    ld      [$2000], a
+    ld      [rROMB], a
     ret
 
 ; ---------------------------------------------------------------------------
@@ -3976,3 +3992,4 @@ FontDataEnd:
 INCLUDE "strings.inc"
 INCLUDE "levels.inc"
 INCLUDE "music.inc"
+
